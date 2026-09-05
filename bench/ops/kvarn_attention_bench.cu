@@ -54,12 +54,12 @@ int main(int argc, char** argv) {
                 context = static_cast<int>(number);
             } else if (argument == "--batch" && number >= 1 && number <= 8) {
                 batch = static_cast<int>(number);
-            } else if (argument == "--width" && number >= 1 && number <= 6) {
+            } else if (argument == "--width" && number >= 1 && number <= 16) {
                 selected_width = static_cast<int>(number);
             } else {
                 throw std::invalid_argument(
                     "usage: ninfer_kvarn_attention_bench [--context 128..262144] "
-                    "[--batch 1..8] [--width 1..6] "
+                    "[--batch 1..8] [--width 1..16] "
                     "[--phase cached|append|provisional|prefill] "
                     "[--tight-envelope]");
             }
@@ -229,6 +229,7 @@ int main(int argc, char** argv) {
         for (int width = 1; width <= 6; ++width) {
             measure("provisional", width, false, false, true);
         }
+        if (selected_width > 6) { measure("provisional", selected_width, false, false, true); }
         if (batch == 1) { measure("prefill", std::min(context, 1024), false, false, false); }
         if (measured_cases == 0) {
             throw std::invalid_argument("phase and width selectors matched no benchmark case");

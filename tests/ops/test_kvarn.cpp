@@ -1413,6 +1413,11 @@ int main() {
     failures += run_speculative_boundary_case<4, 24, 520>(6, 6, 6, 32798);
     failures += run_speculative_boundary_case<4, 24, 1940>(6, 6, 1, 122878);
     failures += run_speculative_boundary_case<4, 24, 1940>(4, 3, 2, 122879);
+    for (int width : {8, 16}) {
+        failures += run_speculative_boundary_case<4, 24>(width, width, 1, 4094);
+        failures += run_speculative_boundary_case<4, 24, 1940>(width, width - 1, 2, 122878);
+    }
+    failures += run_speculative_boundary_case<4, 24, 3074>(4, 4, 1, 196604);
     failures += run_speculative_boundary_case<2, 16>(16, 13, 1, 190);
     CacheFixture<4, 34> packed_cache;
     append_cache(packed_cache, make_cache_values(2118, 0xe001U, 4),

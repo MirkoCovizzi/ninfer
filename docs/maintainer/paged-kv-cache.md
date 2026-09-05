@@ -99,7 +99,8 @@ and tail values and their page markers belong to the continuation StateImage.
 Every completed non-sink page is encoded before attention, including a provisional page. Ordinary
 append retires its BF16 marker immediately. Provisional append retains the BF16 values for rollback:
 queries before the page's closing position read BF16, and queries at or after closure read the
-record. Packed query groups split at this representation boundary. Acceptance only retires markers
+record. Only KV splits intersecting the closing page separate packed query groups at this
+representation boundary; unaffected history retains packed reuse. Acceptance only retires markers
 for completed accepted pages; it does not encode again. A rejected page's tentative record is
 ignored until replacement tokens complete the page and re-encode it from the retained BF16 prefix.
 Prefill continues to encode complete prompt pages before attending to them.
@@ -110,6 +111,8 @@ boundary. Choosing one partition from the final column for earlier columns repro
 divergence after the 4K transition. The packed denominator combines per-lane tile sums before
 reducing lanes, matching the scalar route's order. These constraints preserve packed K/V reuse
 where it is valid rather than falling back to scalar execution everywhere.
+Packed group membership may differ between KV splits. The reducer reads each query's own visible
+position for its scalar split count, independently of producer grouping, and retains split order.
 The reducer computes each split's FP32 softmax weight once and shares it across output dimensions;
 the numerator and denominator accumulation orders are unchanged.
 The private BF16 probability tile uses a KVarN-local row-bit swizzle for conflict-free matrix loads;

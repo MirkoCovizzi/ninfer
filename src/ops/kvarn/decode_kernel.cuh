@@ -62,24 +62,28 @@ __device__ __forceinline__ int decode_tail_slot(const std::int32_t* markers, int
 }
 
 // The closing query sees the encoded page, whereas earlier queries still see its BF16 tail.
-// Packed CTAs must not share K/V staging across that representation boundary.
+// Only splits touching that page must separate queries across the representation boundary.
 __device__ __forceinline__ int decode_tail_boundary(int first_position, int tokens) {
     if (first_position / Group < kKvarnSinkPages) { return tokens; }
     return min(tokens, Group - 1 - (first_position & (Group - 1)));
 }
 
-// Share staged K/V only while every column retains its scalar split partition and page view.
+// Share staged K/V while every column retains its scalar partition and page view in this split.
 template <typename Geometry, int ColumnsPerBlock>
 __device__ __forceinline__ int decode_group_end(int first_position, int begin, int tokens,
-                                                int split_capacity) {
-    int end            = min(begin + ColumnsPerBlock, tokens);
-    const int boundary = decode_tail_boundary(first_position + begin, end - begin);
-    if (boundary > 0) { end = min(end, begin + boundary); }
-    const int window = first_position + begin + 1;
-    const int splits = kvarn_decode_active_splits<Geometry>(window, split_capacity);
-    const int tiles  = div_up(window, kDecodeBc);
-    const bool tiled = tiles >= splits;
-    const int units  = div_up(tiled ? tiles : window, splits);
+                                                int split_capacity, int split) {
+    int end              = min(begin + ColumnsPerBlock, tokens);
+    const int window     = first_position + begin + 1;
+    const int splits     = kvarn_decode_active_splits<Geometry>(window, split_capacity);
+    const int tiles      = div_up(window, kDecodeBc);
+    const bool tiled     = tiles >= splits;
+    const int units      = div_up(tiled ? tiles : window, splits);
+    const int split_size = units * (tiled ? kDecodeBc : 1);
+    const int page_begin = ((window - 1) / Group) * Group;
+    if (split * split_size < page_begin + Group && (split + 1) * split_size > page_begin) {
+        const int boundary = decode_tail_boundary(first_position + begin, end - begin);
+        if (boundary > 0) { end = min(end, begin + boundary); }
+    }
     // Stop at the next unit-size, split-count, or policy change without scanning columns.
     int partition_end = units * splits * (tiled ? kDecodeBc : 1);
     if (!tiled) { partition_end = min(partition_end, (splits - 1) * kDecodeBc); }
@@ -403,7 +407,8 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
         for (int group = 0; group <= column_group && group_end < tokens; ++group) {
             group_begin = group_end;
             group_end   = decode_group_end<Geometry, ColumnsPerBlock>(
-                positions[batch_column_base + column_begin], group_begin, tokens, split_count);
+                positions[batch_column_base + column_begin], group_begin, tokens, split_count,
+                split);
             if (group < column_group && group_end == tokens) { group_begin = tokens; }
         }
     }
@@ -779,7 +784,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                         probability_fragment[0], probability_fragment[1], probability_fragment[2],
                         probability_fragment[3],
                         smem_addr(&p_s[group_lane * Br * Bc + a_rowoff * Bc +
-                                        decode_probability_swizzle(a_rowoff, probability_col)]));
+                                       decode_probability_swizzle(a_rowoff, probability_col)]));
                     unsigned value_fragment[2];
                     const int value_row = k * 16 + b_koff + b_rin;
                     const int value_col = global_n * 8;
@@ -867,7 +872,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
     }
 }
 
-template <typename Geometry, bool MultiBatch, bool Masked, bool PerTokenSplits, int ColumnsPerBlock>
+template <typename Geometry, bool MultiBatch, bool Masked>
 __launch_bounds__(D) __global__
     void reduce_output_hadamard_kernel(const __nv_bfloat16* partial_acc, const float* partial_m,
                                        const float* partial_l, const std::int32_t* positions,
@@ -891,20 +896,8 @@ __launch_bounds__(D) __global__
 
     positions += column_begin;
     if constexpr (MultiBatch) { positions += batch * full_width; }
-    int split_token = PerTokenSplits ? token : tokens - 1;
-    if constexpr (ColumnsPerBlock > 1) {
-        const int valid_tokens = Masked ? min(tokens, valid_columns[batch] - column_begin) : tokens;
-        for (int begin = 0; begin < tokens;) {
-            const int end = decode_group_end<Geometry, ColumnsPerBlock>(positions[0], begin, tokens,
-                                                                        split_count);
-            if (token < end) {
-                if (begin < valid_tokens) { split_token = min(end, valid_tokens) - 1; }
-                break;
-            }
-            begin = end;
-        }
-    }
-    const int query_position = positions[split_token];
+    // Group membership can differ by split; each query still retains its scalar split count.
+    const int query_position = positions[token];
     int output_column        = column_begin + token;
     if constexpr (MultiBatch) { output_column += batch * full_width; }
 

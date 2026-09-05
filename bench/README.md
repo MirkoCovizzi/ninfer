@@ -31,13 +31,15 @@ identifies samples containing page-closing Sinkhorn work. Compare, for example, 
 with `--context 8198` to distinguish closure cost from ordinary small-width append cost. Do not interpret the
 former as an amortized per-token latency.
 
-Use `--phase cached|append|provisional|prefill` and `--width 1..6` to isolate a decode/append
+Use `--phase cached|append|provisional|prefill` and `--width 1..16` to isolate a decode/append
 case for kernel profiling; omit `--width` for the 1,024-token prefill case. `--batch 1..8` uses
 independent cache rows with equal context lengths; prefill is measured only at batch one.
 Provisional cases supply explicit valid-column counts, as the Engine does. Multi-row cases use
 the runtime's conservative lower execution-envelope bound by default. `--tight-envelope` instead
 uses the exact common frontier to measure launch overprovisioning on this homogeneous fixture;
 it is not a production optimization or evidence that arbitrary mixed-row graphs can use that bound.
+Explicit widths 7..16 select provisional Op calls; the default sweep remains 1..6. These wider
+calls exercise the current six-column chunk decomposition, not an Engine MTP depth above five.
 
 ```bash
 ./build/bench/ninfer_kvarn_attention_bench --context 196614 --phase provisional --width 4
@@ -85,6 +87,30 @@ Nsight Compute 2025.4.1 at its base-clock setting attributed the operator improv
 shared-memory wavefronts falling from 14,283,232 to 1,304,992; probability matrix-load conflicts
 were eliminated, while occupancy remained one 512-thread CTA per SM. Qualification passed the
 independent KVarN Op suite, all-depth 8,192-token greedy parity, and C=2 MTP3 prefix restoration.
+
+Split-local page-boundary grouping further limits duplicated history traversal to the KV splits
+that actually intersect a closing page. On the same GPU/toolchain, C=1 page-closing Op calls ending
+at 196,608 keys changed as follows (medians in us):
+
+| Logical width | Global boundary grouping | Split-local boundary grouping |
+|---|---:|---:|
+| 4 | 1542.144 | 968.704 |
+| 8 | 3384.288 | 2672.640 |
+| 16 | 5074.944 | 4364.288 |
+
+The non-closing width-16 case ending at 196,624 keys was effectively unchanged, 4213.760 versus
+4204.512 us. Width-8/16 samples were variable; these are workload-specific measurements, not a
+uniform speedup claim. Nsight Compute confirms that the closing width-four producer performs
+near ordinary-call work: 315.1 million executed instructions versus 311.6 million in the preceding
+non-closing swizzled profile, with the same 984-CTA launch capacity and one resident CTA per SM.
+
+The matched C=1 MTP3 Engine workload above changed from 133.40 to 133.67 tok/s at 32K and
+87.25 to 87.79 tok/s at 128K, with unchanged acceptance. This is a substantial reduction in periodic
+closure cost, but only a small single-run average throughput gain. Independent Op checks include
+exact sequential/provisional, graph replay, and replacement encoding at logical widths 8 and 16;
+all-depth 8,192-token Engine parity and C=2 MTP5 prefix restoration also passed. The separate
+dynamic-MTP branch uses its own chunk policy and graph topology: these results do not qualify
+K=15 Engine behavior or throughput on that branch.
 
 The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
