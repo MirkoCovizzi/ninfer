@@ -351,22 +351,24 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
     constexpr int WarpsPerColumn           = kDecodeWarps;
     constexpr int Wc                       = WarpsPerColumn * WarpGroups;
     constexpr int Br                       = kDecodeBr;
+    constexpr int StatRows                 = ColumnsPerBlock == 4 ? Br : Geometry::GroupSize;
     constexpr int Bc                       = kDecodeBc;
     constexpr int Threads                  = Wc * 32;
     constexpr int QKNt                     = Bc / 8;
     constexpr int QKKs                     = D / 16;
     constexpr int PVNt                     = D / 8;
-    constexpr int ProducerWarpsPerColumn   = ColumnsPerBlock == 4 ? 4 : 1;
+    constexpr int ProducerWarpsPerColumn   = ColumnsPerBlock == 4 ? 4 : 2;
     constexpr int ValueStageWarpsPerColumn = WarpsPerColumn - ProducerWarpsPerColumn;
     constexpr int ValueStageWarps          = ValueStageWarpsPerColumn * WarpGroups;
-    constexpr int PVWarpsPerColumn = ColumnsPerBlock == 4 ? WarpsPerColumn : WarpsPerColumn - 1;
-    constexpr int FirstPVWarp      = WarpsPerColumn - PVWarpsPerColumn;
-    constexpr int PVNtPerWarp      = div_up(PVNt, PVWarpsPerColumn);
-    constexpr int QKNtPerWarp      = QKNt / ProducerWarpsPerColumn;
-    constexpr int PVKs             = Bc / 16;
-    constexpr int PageIds          = 64;
-    constexpr float Log2E          = 1.4426950408889634074f;
-    constexpr unsigned FullMask    = 0xffffffffu;
+    constexpr int PVWarpsPerColumn =
+        ColumnsPerBlock == 4 ? WarpsPerColumn : WarpsPerColumn - ProducerWarpsPerColumn;
+    constexpr int FirstPVWarp   = WarpsPerColumn - PVWarpsPerColumn;
+    constexpr int PVNtPerWarp   = div_up(PVNt, PVWarpsPerColumn);
+    constexpr int QKNtPerWarp   = QKNt / ProducerWarpsPerColumn;
+    constexpr int PVKs          = Bc / 16;
+    constexpr int PageIds       = 64;
+    constexpr float Log2E       = 1.4426950408889634074f;
+    constexpr unsigned FullMask = 0xffffffffu;
     static_assert(Group == 2 * Bc);
     static_assert(QKNt % ProducerWarpsPerColumn == 0);
     static_assert(Geometry::GroupSize <= Br);
@@ -374,9 +376,9 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
     __shared__ __align__(16) __nv_bfloat16 qkv_s[2 * Bc * D];
     __shared__ __align__(16) __nv_bfloat16 p_s[WarpGroups * Br * Bc];
     __shared__ float alpha_s[WarpGroups * Br];
-    __shared__ float producer_m_s[WarpGroups][ProducerWarpsPerColumn][Br];
-    __shared__ float producer_l_s[WarpGroups][ProducerWarpsPerColumn][Br][4];
-    __shared__ float running_m_s[WarpGroups][Br];
+    __shared__ float producer_m_s[WarpGroups][ProducerWarpsPerColumn][StatRows];
+    __shared__ float producer_l_s[WarpGroups][QKNt - QKNtPerWarp][StatRows][4];
+    __shared__ float running_m_s[WarpGroups][StatRows];
     __shared__ __align__(16) unsigned packed_k_s[kPackedKWords];
     __shared__ __align__(16) std::uint8_t packed_v_s[kPackedVBytes];
     __shared__ DecodeRecordMetadata metadata_s;
@@ -511,14 +513,14 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
     const int b_koff   = ((lane >> 3) & 1) << 3;
 
     // The four-column route splits QK across four producers, uses the other four warps to stage V,
-    // then puts all eight warps on PV. Other routes retain fixed producer/consumer roles.
+    // then puts all eight warps on PV. Scalar columns use two QK and six V/PV warps.
     union {
         unsigned query_fragment[ColumnsPerBlock >= 3 ? 1 : QKKs][4];
         float accumulator[PVNtPerWarp][4];
     } warp_state;
 
     if constexpr (ColumnsPerBlock < 3) {
-        if (local_warp == 0) {
+        if (local_warp < ProducerWarpsPerColumn) {
 #pragma unroll
             for (int k = 0; k < QKKs; ++k) {
                 const int query_col = k * 16 + a_coloff;
@@ -645,42 +647,45 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
             float next_m1;
             float alpha0;
             float alpha1;
-            if constexpr (ProducerWarpsPerColumn == 1) {
-                next_m0 = fmaxf(m0, block_m0);
-                next_m1 = fmaxf(m1, block_m1);
-                alpha0  = m0 == -CUDART_INF_F ? 0.0f : exp2_approx((m0 - next_m0) * Log2E);
-                alpha1  = m1 == -CUDART_INF_F ? 0.0f : exp2_approx((m1 - next_m1) * Log2E);
-            } else {
+            {
                 if (lid == 0) {
-                    producer_m_s[group_lane][local_warp][row0] = block_m0;
-                    producer_m_s[group_lane][local_warp][row1] = block_m1;
-                    if (local_warp == 0) {
-                        running_m_s[group_lane][row0] = m0;
-                        running_m_s[group_lane][row1] = m1;
+                    if (row0 < StatRows) {
+                        producer_m_s[group_lane][local_warp][row0] = block_m0;
+                        if (local_warp == 0) { running_m_s[group_lane][row0] = m0; }
+                    }
+                    if (row1 < StatRows) {
+                        producer_m_s[group_lane][local_warp][row1] = block_m1;
+                        if (local_warp == 0) { running_m_s[group_lane][row1] = m1; }
                     }
                 }
                 if (group_lane == 0) {
-                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                    asm volatile("bar.sync 1, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 } else {
-                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    asm volatile("bar.sync 2, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 }
-                block_m0 = producer_m_s[group_lane][0][row0];
-                block_m1 = producer_m_s[group_lane][0][row1];
+                block_m0 = row0 < StatRows ? producer_m_s[group_lane][0][row0] : -CUDART_INF_F;
+                block_m1 = row1 < StatRows ? producer_m_s[group_lane][0][row1] : -CUDART_INF_F;
 #pragma unroll
                 for (int producer = 1; producer < ProducerWarpsPerColumn; ++producer) {
-                    block_m0 = fmaxf(block_m0, producer_m_s[group_lane][producer][row0]);
-                    block_m1 = fmaxf(block_m1, producer_m_s[group_lane][producer][row1]);
+                    if (row0 < StatRows) {
+                        block_m0 = fmaxf(block_m0, producer_m_s[group_lane][producer][row0]);
+                    }
+                    if (row1 < StatRows) {
+                        block_m1 = fmaxf(block_m1, producer_m_s[group_lane][producer][row1]);
+                    }
                 }
-                const float previous_m0 = running_m_s[group_lane][row0];
-                const float previous_m1 = running_m_s[group_lane][row1];
-                next_m0                 = fmaxf(previous_m0, block_m0);
-                next_m1                 = fmaxf(previous_m1, block_m1);
-                alpha0                  = previous_m0 == -CUDART_INF_F
-                                              ? 0.0f
-                                              : exp2_approx((previous_m0 - next_m0) * Log2E);
-                alpha1                  = previous_m1 == -CUDART_INF_F
-                                              ? 0.0f
-                                              : exp2_approx((previous_m1 - next_m1) * Log2E);
+                const float previous_m0 =
+                    row0 < StatRows ? running_m_s[group_lane][row0] : -CUDART_INF_F;
+                const float previous_m1 =
+                    row1 < StatRows ? running_m_s[group_lane][row1] : -CUDART_INF_F;
+                next_m0 = fmaxf(previous_m0, block_m0);
+                next_m1 = fmaxf(previous_m1, block_m1);
+                alpha0  = previous_m0 == -CUDART_INF_F
+                              ? 0.0f
+                              : exp2_approx((previous_m0 - next_m0) * Log2E);
+                alpha1  = previous_m1 == -CUDART_INF_F
+                              ? 0.0f
+                              : exp2_approx((previous_m1 - next_m1) * Log2E);
             }
             float block_l0 = 0.0f, block_l1 = 0.0f;
 #pragma unroll
@@ -700,8 +705,17 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                 const float p11 = next_m1 > -CUDART_INF_F && score[local_tile][3] > -CUDART_INF_F
                                       ? exp2_approx((score[local_tile][3] - next_m1) * Log2E)
                                       : 0.0f;
-                block_l0 += p00 + p01;
-                block_l1 += p10 + p11;
+                if (local_warp == 0) {
+                    block_l0 += p00 + p01;
+                    block_l1 += p10 + p11;
+                } else {
+                    if (row0 < StatRows) {
+                        producer_l_s[group_lane][tile - QKNtPerWarp][row0][lid] = p00 + p01;
+                    }
+                    if (row1 < StatRows) {
+                        producer_l_s[group_lane][tile - QKNtPerWarp][row1][lid] = p10 + p11;
+                    }
+                }
                 const int probability_base = group_lane * Br * Bc;
                 p_s[probability_base + gid * Bc + decode_probability_swizzle(gid, col0)] =
                     __float2bfloat16(p00);
@@ -712,31 +726,22 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                 p_s[probability_base + (gid + 8) * Bc + decode_probability_swizzle(gid + 8, col1)] =
                     __float2bfloat16(p11);
             }
-            if constexpr (ProducerWarpsPerColumn == 1) {
-                block_l0 = warp_sum<4>(block_l0, FullMask);
-                block_l1 = warp_sum<4>(block_l1, FullMask);
-                l0       = l0 * alpha0 + block_l0;
-                l1       = l1 * alpha1 + block_l1;
-                m0       = next_m0;
-                m1       = next_m1;
-                if (lid == 0) {
-                    alpha_s[group_lane * Br + row0] = alpha0;
-                    alpha_s[group_lane * Br + row1] = alpha1;
-                }
-            } else {
-                producer_l_s[group_lane][local_warp][row0][lid] = block_l0;
-                producer_l_s[group_lane][local_warp][row1][lid] = block_l1;
+            {
                 if (group_lane == 0) {
-                    asm volatile("bar.sync 1, 128;" ::: "memory");
+                    asm volatile("bar.sync 1, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 } else {
-                    asm volatile("bar.sync 2, 128;" ::: "memory");
+                    asm volatile("bar.sync 2, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 }
                 if (local_warp == 0) {
-                    // Preserve the scalar route's per-lane tile sum before reducing lanes.
+                    // Add individual tiles in order, not reassociated producer-local sums.
 #pragma unroll
-                    for (int producer = 1; producer < ProducerWarpsPerColumn; ++producer) {
-                        block_l0 += producer_l_s[group_lane][producer][row0][lid];
-                        block_l1 += producer_l_s[group_lane][producer][row1][lid];
+                    for (int tile = 0; tile < QKNt - QKNtPerWarp; ++tile) {
+                        if (row0 < StatRows) {
+                            block_l0 += producer_l_s[group_lane][tile][row0][lid];
+                        }
+                        if (row1 < StatRows) {
+                            block_l1 += producer_l_s[group_lane][tile][row1][lid];
+                        }
                     }
                     block_l0 = warp_sum<4>(block_l0, FullMask);
                     block_l1 = warp_sum<4>(block_l1, FullMask);

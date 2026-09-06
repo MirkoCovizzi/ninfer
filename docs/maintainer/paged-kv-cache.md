@@ -117,6 +117,10 @@ The reducer computes each split's FP32 softmax weight once and shares it across 
 the numerator and denominator accumulation orders are unchanged.
 The private BF16 probability tile uses a KVarN-local row-bit swizzle for conflict-free matrix loads;
 this changes only shared-memory addresses, not represented values or reduction order.
+Scalar columns use two QK producer warps and six V-staging/PV warps. Producer statistics contain
+only real query-head rows so that two scalar CTAs still fit per SM. Producers exchange individual
+per-lane tile sums, not producer-local subtotal sums, preserving the sequential addition order
+before lane reduction. Packed four-column CTAs retain their four-producer schedule.
 
 #### Paper And Reference Alignment
 

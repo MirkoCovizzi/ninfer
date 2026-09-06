@@ -112,6 +112,21 @@ all-depth 8,192-token Engine parity and C=2 MTP5 prefix restoration also passed.
 dynamic-MTP branch uses its own chunk policy and graph topology: these results do not qualify
 K=15 Engine behavior or throughput on that branch.
 
+The scalar decode schedule uses two QK producers and six V/PV workers, with compact collective
+statistics for the real query-head rows. On the same GPU/toolchain, width-one provisional Op
+medians at 8,198 / 32,774 / 131,078 / 196,614 keys changed from
+44.480 / 103.584 / 393.216 / 576.512 us to 43.392 / 96.640 / 372.736 / 546.816 us.
+The four-column 192K check changed from 772.096 to 759.808 us; width-six samples remained variable
+and do not establish a gain. The selected implementation retains the original V metadata layout.
+
+A matched C=1 MTP0 public Engine run on Qwen3.8-27B NVFP4 used graphs, 1,024-token prefill chunks,
+one warmup, and one measured repetition. Decode throughput changed from 40.93 to 40.98 tok/s at
+32,799 + 128, and from 30.41 to 30.72 tok/s at 194,431 + 128. Prefill was unchanged within 0.1%.
+These are single-run measurements, not a statistical guarantee or a replacement for the separate
+needle-test throughput measurement. Nsight Compute 2025.4.1 confirms 49,992 bytes of static shared
+memory, 128 registers/thread, two resident 256-thread CTAs per SM, and no spills for scalar H24/KV4.
+Independent Op checks, all-depth 8,192-token greedy parity, and C=2 MTP3 prefix restoration passed.
+
 The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
 have a private prefill/decode loop and does not call target implementation interfaces.
