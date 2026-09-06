@@ -1073,7 +1073,7 @@ int run_27b_attention_case() {
 
 template <int Width, int Valid = Width, int Context = 122943>
 int run_27b_grouped_decode_case() {
-    static_assert(Width >= 2 && Width <= 6);
+    static_assert(Width >= 2 && Width <= 16);
     static_assert(Valid > 0 && Valid <= Width);
     constexpr int Heads        = 4;
     constexpr int QueryHeads   = 24;
@@ -1158,8 +1158,9 @@ int run_27b_grouped_decode_case() {
     const std::string label = "KVarN H24/KV4 grouped decode width=" + std::to_string(Width) +
                               " valid=" + std::to_string(Valid);
     const auto compare = [&] {
+        // Wider prefixes exceed exact BF16 partial-numerator representation.
         return compare_profile(label.c_str(), from_device_bf16(output, query.size()), expected,
-                               1.0e-7);
+                               Width > 8 ? 8.0e-3 : 1.0e-7);
     };
     int failures = compare();
 
@@ -1386,6 +1387,8 @@ int main() {
     failures += run_27b_grouped_decode_case<4, 4, 4095>();
     failures += run_27b_grouped_decode_case<5>();
     failures += run_27b_grouped_decode_case<6>();
+    failures += run_27b_grouped_decode_case<8, 7, 32784>();
+    failures += run_27b_grouped_decode_case<16, 15, 196624>();
     failures += run_35b_attention_case();
     failures += run_prefill_slab_boundary_case();
     failures += run_batched_attention_case<4>(24, "KVarN H24/KV4 B=2 attention");
@@ -1415,15 +1418,21 @@ int main() {
     failures += run_speculative_boundary_case<4, 24, 1940>(4, 3, 2, 122879);
     for (int width : {8, 16}) {
         failures += run_speculative_boundary_case<4, 24>(width, width, 1, 4094);
+        failures += run_speculative_boundary_case<4, 24>(width, width, 1, 8190);
         failures += run_speculative_boundary_case<4, 24, 1940>(width, width - 1, 2, 122878);
     }
+    failures += run_speculative_boundary_case<4, 24>(16, 7, 2, 2110);
     failures += run_speculative_boundary_case<4, 24, 3074>(4, 4, 1, 196604);
     failures += run_speculative_boundary_case<2, 16>(16, 13, 1, 190);
     CacheFixture<4, 34> packed_cache;
-    append_cache(packed_cache, make_cache_values(2118, 0xe001U, 4),
-                 make_cache_values(2118, 0xe002U, 4), 0, false);
+    append_cache(packed_cache, make_cache_values(2128, 0xe001U, 4),
+                 make_cache_values(2128, 0xe002U, 4), 0, false);
     failures +=
         run_cached_attention_case(packed_cache, 24, 2112, 6, "KVarN random packed attention");
+    failures +=
+        run_cached_attention_case(packed_cache, 24, 2112, 8, "KVarN random width-8 attention");
+    failures +=
+        run_cached_attention_case(packed_cache, 24, 2112, 16, "KVarN random width-16 attention");
     std::cout << (failures == 0 ? "OK" : "FAIL") << " kvarn correctness\n";
     return failures == 0 ? 0 : 1;
 }

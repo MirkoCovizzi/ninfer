@@ -90,13 +90,14 @@ void launch_partial(const Tensor& query, const Tensor& positions, const Tensor& 
                     Tensor& output, cudaStream_t stream) {
     const dim3 grid(Geometry::KVHeads, splits,
                     query.ne[3] * div_up(width + 2 * (ColumnsPerBlock - 1), ColumnsPerBlock));
-    constexpr int query_groups = ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock;
+    constexpr int query_groups    = ColumnsPerBlock >= 4 ? ColumnsPerBlock / 2 : ColumnsPerBlock;
+    constexpr int warps_per_group = ColumnsPerBlock == 8 ? 4 : detail::kDecodeWarps;
     constexpr std::size_t query_smem =
         ColumnsPerBlock >= 3
             ? static_cast<std::size_t>(query_groups) * detail::kDecodeBr * D * sizeof(__nv_bfloat16)
             : 0;
     detail::attention_decode_kernel<Geometry, MultiBatch, Masked, ColumnsPerBlock>
-        <<<grid, detail::kDecodeWarps * query_groups * 32, query_smem, stream>>>(
+        <<<grid, warps_per_group * query_groups * 32, query_smem, stream>>>(
             static_cast<const __nv_bfloat16*>(query.data),
             static_cast<const std::uint8_t*>(cache.records.data),
             static_cast<const __nv_bfloat16*>(cache.tail_k.data),
@@ -153,12 +154,14 @@ void decode_attention(const Tensor& query, const Tensor& positions, const Tensor
     }
     Tensor rotated_query = query;
     kvarn_hadamard(query, rotated_query, stream);
-    constexpr int kChunk = 6;
+    const int kChunk =
+        query.ne[1] == CausalD256H24Kv4::QHeads && envelope.max_visible_keys > MtpPackedWindow ? 8
+                                                                                               : 6;
     for (int begin = 0; begin < query.ne[2]; begin += kChunk) {
         const int width = std::min(kChunk, query.ne[2] - begin);
         auto scope      = workspace.scope();
         int split_capacity =
-            ops::detail::causal_attention_split_capacity(query.ne[1], width, DType::BF16, envelope);
+            ops::detail::causal_attention_split_capacity(query.ne[1], 1, DType::BF16, envelope);
         if (query.ne[1] == CausalD256H24Kv4::QHeads && envelope.max_visible_keys > 8198) {
             split_capacity = std::max(split_capacity, DecodeLongSplits);
         }
@@ -180,8 +183,12 @@ void decode_attention(const Tensor& query, const Tensor& positions, const Tensor
             const bool pair_columns = Geometry::QHeads == CausalD256H24Kv4::QHeads && width > 1 &&
                                       envelope.max_visible_keys > MtpPackedWindow;
             const auto launch = [&]<bool MultiBatch, bool Masked>() {
-                if (pair_columns) {
-                    // Narrow widths mask unused columns; widths five and six use a second CTA.
+                if (pair_columns && width > 4) {
+                    launch_partial<Geometry, MultiBatch, Masked, 8>(
+                        query, positions, valid_columns, table_rows, scale, cache, envelope, begin,
+                        width, splits, acc, m, l, output, stream);
+                } else if (pair_columns) {
+                    // Narrow widths mask unused columns.
                     launch_partial<Geometry, MultiBatch, Masked, 4>(
                         query, positions, valid_columns, table_rows, scale, cache, envelope, begin,
                         width, splits, acc, m, l, output, stream);

@@ -334,7 +334,7 @@ stage_decode_value(__nv_bfloat16* destination, const std::uint8_t* packed_v,
 }
 
 template <typename Geometry, bool MultiBatch, bool Masked, int ColumnsPerBlock = 1>
-__launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32,
+__launch_bounds__((ColumnsPerBlock >= 4 ? 16 : kDecodeWarps * ColumnsPerBlock) * 32,
                   ColumnsPerBlock == 1 ? 2 : 1) __global__
     void attention_decode_kernel(const __nv_bfloat16* q, const std::uint8_t* records,
                                  const __nv_bfloat16* tail_k, const __nv_bfloat16* tail_v,
@@ -345,13 +345,13 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                                  std::int32_t full_width, std::int32_t column_begin,
                                  std::int32_t logical_capacity, std::int32_t heads, float scale,
                                  __nv_bfloat16* partial_acc, float* partial_m, float* partial_l) {
-    static_assert(ColumnsPerBlock >= 1 && ColumnsPerBlock <= 4);
-    constexpr int ColumnsPerMma            = ColumnsPerBlock == 4 ? 2 : 1;
+    static_assert(ColumnsPerBlock == 1 || ColumnsPerBlock == 4 || ColumnsPerBlock == 8);
+    constexpr int ColumnsPerMma            = ColumnsPerBlock >= 4 ? 2 : 1;
     constexpr int WarpGroups               = ColumnsPerBlock / ColumnsPerMma;
-    constexpr int WarpsPerColumn           = kDecodeWarps;
+    constexpr int WarpsPerColumn           = ColumnsPerBlock == 8 ? 4 : kDecodeWarps;
     constexpr int Wc                       = WarpsPerColumn * WarpGroups;
     constexpr int Br                       = kDecodeBr;
-    constexpr int StatRows                 = ColumnsPerBlock == 4 ? Br : Geometry::GroupSize;
+    constexpr int StatRows                 = ColumnsPerBlock >= 4 ? Br : Geometry::GroupSize;
     constexpr int Bc                       = kDecodeBc;
     constexpr int Threads                  = Wc * 32;
     constexpr int QKNt                     = Bc / 8;
@@ -361,7 +361,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
     constexpr int ValueStageWarpsPerColumn = WarpsPerColumn - ProducerWarpsPerColumn;
     constexpr int ValueStageWarps          = ValueStageWarpsPerColumn * WarpGroups;
     constexpr int PVWarpsPerColumn =
-        ColumnsPerBlock == 4 ? WarpsPerColumn : WarpsPerColumn - ProducerWarpsPerColumn;
+        ColumnsPerBlock >= 4 ? WarpsPerColumn : WarpsPerColumn - ProducerWarpsPerColumn;
     constexpr int FirstPVWarp   = WarpsPerColumn - PVWarpsPerColumn;
     constexpr int PVNtPerWarp   = div_up(PVNt, PVWarpsPerColumn);
     constexpr int QKNtPerWarp   = QKNt / ProducerWarpsPerColumn;
@@ -514,6 +514,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
 
     // The four-column route splits QK across four producers, uses the other four warps to stage V,
     // then puts all eight warps on PV. Scalar columns use two QK and six V/PV warps.
+    // Eight columns use four two-query groups with two QK producers and all four warps on PV.
     union {
         unsigned query_fragment[ColumnsPerBlock >= 3 ? 1 : QKKs][4];
         float accumulator[PVNtPerWarp][4];
@@ -559,7 +560,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
         if (tail_slot < 0 && (block == 0 || (k0 & (Group - 1)) == 0)) {
             stage_decode_record(packed_k_s, packed_v_s, &metadata_s, record, tid, Threads);
         }
-        if constexpr (ColumnsPerBlock == 4) {
+        if constexpr (ColumnsPerBlock >= 4) {
             if (!key_ready) {
                 stage_decode_key_quad(k_s, packed_k_s, &metadata_s, tail_k, table_row, tail_slot,
                                       heads, kv_head, k0, max(k0, split_start),
@@ -658,7 +659,11 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                         if (local_warp == 0) { running_m_s[group_lane][row1] = m1; }
                     }
                 }
-                if (group_lane == 0) {
+                if constexpr (ColumnsPerBlock == 8) {
+                    asm volatile("bar.sync %0, %1;" ::"r"(group_lane + 1),
+                                 "n"(ProducerWarpsPerColumn * 32)
+                                 : "memory");
+                } else if (group_lane == 0) {
                     asm volatile("bar.sync 1, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 } else {
                     asm volatile("bar.sync 2, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
@@ -727,7 +732,11 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                     __float2bfloat16(p11);
             }
             {
-                if (group_lane == 0) {
+                if constexpr (ColumnsPerBlock == 8) {
+                    asm volatile("bar.sync %0, %1;" ::"r"(group_lane + 1),
+                                 "n"(ProducerWarpsPerColumn * 32)
+                                 : "memory");
+                } else if (group_lane == 0) {
                     asm volatile("bar.sync 1, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
                 } else {
                     asm volatile("bar.sync 2, %0;" ::"n"(ProducerWarpsPerColumn * 32) : "memory");
@@ -805,7 +814,7 @@ __launch_bounds__(kDecodeWarps*(ColumnsPerBlock == 4 ? 2 : ColumnsPerBlock) * 32
                 }
             }
         }
-        if constexpr (ColumnsPerBlock == 4) {
+        if constexpr (ColumnsPerBlock >= 4) {
             const int next_k0 = k0 + Bc;
             if (block + 1 < key_blocks && (next_k0 & (Group - 1)) != 0) {
                 stage_decode_key_quad(k_s, packed_k_s, &metadata_s, tail_k, table_row, tail_slot,

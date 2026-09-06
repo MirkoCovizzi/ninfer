@@ -39,7 +39,7 @@ the runtime's conservative lower execution-envelope bound by default. `--tight-e
 uses the exact common frontier to measure launch overprovisioning on this homogeneous fixture;
 it is not a production optimization or evidence that arbitrary mixed-row graphs can use that bound.
 Explicit widths 7..16 select provisional Op calls; the default sweep remains 1..6. These wider
-calls exercise the current six-column chunk decomposition, not an Engine MTP depth above five.
+H24/KV4 calls use eight-column chunks above 1,024 visible keys, not an Engine MTP depth above five.
 
 ```bash
 ./build/bench/ninfer_kvarn_attention_bench --context 196614 --phase provisional --width 4
@@ -126,6 +126,47 @@ These are single-run measurements, not a statistical guarantee or a replacement 
 needle-test throughput measurement. Nsight Compute 2025.4.1 confirms 49,992 bytes of static shared
 memory, 128 registers/thread, two resident 256-thread CTAs per SM, and no spills for scalar H24/KV4.
 Independent Op checks, all-depth 8,192-token greedy parity, and C=2 MTP3 prefix restoration passed.
+
+**Eight-Column Packed Decode**
+
+The eight-column experiment retained four two-query groups in one 512-thread CTA, sharing staged
+K/V without doubling the thread count. It applies to H24/KV4 widths five through eight above the
+1,024-key packed threshold; wider calls use eight-column chunks. Narrow/scalar dispatch is retained.
+On the same RTX 5090 Laptop GPU and CUDA 13.1/driver 13.2, masked provisional Op medians were:
+
+| Visible keys | Width | Previous six-column chunks, us | Eight-column chunks with four-column CTAs, us | Eight-column CTAs, us |
+|---|---:|---:|---:|---:|
+| 32,784 | 8 | 379.904 | 262.144 | 218.336 |
+| 32,784 | 16 | 620.192 | 504.640 | 426.080 |
+| 196,624 | 8 | 2511.872 | 1499.136 | 1234.944 |
+| 196,624 | 16 | 4195.328 | 3376.128 | 2762.752 |
+| 196,608, page closing | 8 | 2669.568 | 1843.200 | 1687.520 |
+| 196,608, page closing | 16 | 4349.952 | 3534.784 | 3048.416 |
+
+Chunking alone avoids redundant four-column groups as well as launches; the middle column isolates
+that effect from wider in-CTA reuse. Width-six calls do not change chunk decomposition: their
+32K / 128K / 192K medians changed from 255.552 / 1011.712 / 1528.800 us to
+213.184 / 822.144 / 1286.144 us. The 8K sweep also improved. Long-context samples remain variable;
+these are one benchmark invocation per case, each with three warmups and 30 timed Op samples.
+
+For width eight at 196,624 keys, Nsight Compute 2025.4.1 reports 615.4 million executed instructions
+for the chunk-only control versus 407.1 million for the wider CTA. Both use 103 registers/thread,
+one resident CTA per SM, and no spills. Reported static plus dynamic shared memory increases from
+69,376 to 88,576 bytes. Base-clock profiled kernel duration changes from 3.490 to 3.141 ms; those
+durations are not normal-clock Op timings.
+
+A matched public Engine MTP5 run used Qwen3.8-27B NVFP4, the **full proposal head**, graphs,
+1,024-token prefill chunks, one warmup, and one measured repetition. Decode changed from
+138.57 to 139.97 tok/s at 32,799 + 128 and from 96.23 to 102.79 tok/s at 131,103 + 128
+(+1.0% / +6.8%). Acceptance stayed 1.0 at both points; prefill changed by less than 0.1%.
+This is not a statistical guarantee or a comparison with the earlier optimized-proposal-head runs.
+
+Qualification passed the independent KVarN and softmax suites, random width-8/16 represented-cache
+oracles, exact scalar/packed boundary and replacement checks, and graph replay. The wider analytical
+fixture uses a BF16 numerical tolerance; its rounding error was reproduced with the four-column
+control, without changing the exact parity checks. Real Engine MTP5 matched MTP0 through 8,192
+tokens; C=2 MTP5 prefix restoration matched 1,536 / 1,535 tokens, crossing the packed threshold.
+This does not qualify K=15 Engine behavior, the separate dynamic-MTP worktree, or needle-test recall.
 
 The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not

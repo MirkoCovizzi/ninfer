@@ -121,6 +121,12 @@ Scalar columns use two QK producer warps and six V-staging/PV warps. Producer st
 only real query-head rows so that two scalar CTAs still fit per SM. Producers exchange individual
 per-lane tile sums, not producer-local subtotal sums, preserving the sequential addition order
 before lane reduction. Packed four-column CTAs retain their four-producer schedule.
+For H24/KV4 above the 1,024-key packed-dispatch threshold, widths five through eight use one
+eight-column CTA where the partition/page constraints permit. Four two-query groups share one
+staged K/V tile; each group uses two QK producers, two V-staging workers, then all four warps for
+PV. Both packed shapes use 512 threads. Wider calls use eight-column chunks, with partial
+workspace sized for each query's scalar split partition. Narrow packed calls retain the
+four-column kernel; H16/KV2 and the short-context scalar schedule are unchanged.
 
 #### Paper And Reference Alignment
 

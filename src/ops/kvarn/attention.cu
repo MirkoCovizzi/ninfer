@@ -437,10 +437,14 @@ std::size_t kvarn_attention_workspace_capacity_bytes(std::int32_t query_heads,
         throw std::invalid_argument("KVarN workspace: unsupported query-head geometry");
     }
     const std::int32_t kv_heads     = query_heads == 24 ? 4 : 2;
-    const std::int32_t decode_width = std::min(max_width, 6);
-    std::size_t decode              = causal_softmax_attention_workspace_capacity_bytes(
+    const std::int32_t decode_width = std::min(
+        max_width, query_heads == 24 && envelope.max_visible_keys > kvarn::MtpPackedWindow ? 8 : 6);
+    // The BF16 helper owns widths up to six; wider groups retain scalar split partitions.
+    const std::int32_t capacity_width = decode_width > 6 ? 1 : decode_width;
+    std::size_t decode                = causal_softmax_attention_workspace_capacity_bytes(
         {kvarn::D, query_heads, kv_heads}, DType::BF16, envelope, batch_size,
-        std::min(min_width, decode_width), decode_width);
+        std::min(min_width, capacity_width), capacity_width);
+    if (decode_width > 6) { decode *= decode_width; }
     if (query_heads == 24 && envelope.max_visible_keys > 8198) {
         const std::size_t split_rows = static_cast<std::size_t>(query_heads) * decode_width *
                                        batch_size * kvarn::DecodeLongSplits;
