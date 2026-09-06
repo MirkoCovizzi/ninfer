@@ -127,6 +127,10 @@ staged K/V tile; each group uses two QK producers, two V-staging workers, then a
 PV. Both packed shapes use 512 threads. Wider calls use eight-column chunks, with partial
 workspace sized for each query's scalar split partition. Narrow packed calls retain the
 four-column kernel; H16/KV2 and the short-context scalar schedule are unchanged.
+Fully inactive two-query groups skip QK/softmax and PV computation, retaining neutral partial
+statistics and accumulators. Their assigned threads still perform shared K/V staging and join all
+CTA barriers; the compute guard is uniform across each group's producer warps. Active queries
+retain their original arithmetic and reduction order.
 
 #### Paper And Reference Alignment
 

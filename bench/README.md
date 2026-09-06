@@ -168,6 +168,39 @@ control, without changing the exact parity checks. Real Engine MTP5 matched MTP0
 tokens; C=2 MTP5 prefix restoration matched 1,536 / 1,535 tokens, crossing the packed threshold.
 This does not qualify K=15 Engine behavior, the separate dynamic-MTP worktree, or needle-test recall.
 
+**Inactive Packed Groups**
+
+Skipping QK/softmax and PV for fully inactive two-query groups avoids computing padded columns in
+four- and eight-column CTAs. Shared K/V staging, CTA barriers, neutral outputs, and active-query
+arithmetic remain unchanged. Against the eight-column implementation above, on the same GPU and
+toolchain, masked width-six provisional Op medians changed as follows:
+
+| Visible keys | Before, us | After, us |
+|---|---:|---:|
+| 8,240 | 78.848 | 68.800 |
+| 32,784 | 213.312 | 181.696 |
+| 131,088 | 825.312 | 712.704 |
+| 196,624 | 1240.032 | 1051.648 |
+| 196,608, page closing | 1658.880 | 1252.352 |
+
+Width-five cases also improved. At 196,624 keys, width two changed from 753.664 to 625.664 us;
+scalar and full-width 4/8/16 controls showed no material change. C=2 width six at 32,784 keys with
+the conservative envelope changed from 426.496 to 368.992 us. These use the same three-warmup,
+30-sample Op procedure; long-context timing variability remains visible in min/p95 measurements.
+
+A matched width-six Nsight Compute comparison at 196,624 keys reports executed instructions
+falling from 402.2 to 369.6 million and registers/thread from 103 to 94. Both retain the same
+512-thread launch, 88,576 bytes of reported static plus dynamic shared memory, one resident CTA
+per SM, and no spills. Base-clock profiled kernel duration changes from 3.118 to 2.589 ms.
+
+The matched public Engine MTP5 workload above, again using the full proposal head and one measured
+repetition, changed from 139.66 to 141.99 tok/s at 32,799 + 128 and from 102.69 to 108.55 tok/s
+at 131,103 + 128 (+1.7% / +5.7%). Acceptance remained 1.0; prefill changed by less than 0.2%.
+These single-run gains do not establish statistical significance or performance at other MTP depths.
+The existing independent KVarN/softmax suites and exact boundary/masking/graph checks passed.
+All MTP depths 1 through 5 matched MTP0 through 8,192 generated tokens; C=2 MTP5 prefix restoration
+matched 1,536 / 1,535 tokens. No needle rerun or dynamic-MTP Engine qualification was performed.
+
 The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
 have a private prefill/decode loop and does not call target implementation interfaces.

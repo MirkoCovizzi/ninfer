@@ -454,6 +454,8 @@ __launch_bounds__((ColumnsPerBlock >= 4 ? 16 : kDecodeWarps * ColumnsPerBlock) *
     const int valid_tokens = Masked ? min(tokens, valid_columns[batch] - column_begin) : tokens;
     const bool valid0      = column < group_end && column < valid_tokens;
     const bool valid1 = ColumnsPerMma == 2 && column + 1 < group_end && column + 1 < valid_tokens;
+    // Inactive packed groups still stage shared K/V and join every CTA barrier.
+    const bool compute_group = ColumnsPerBlock == 1 || valid0;
     if (kv_head >= Geometry::KVHeads || group_begin >= valid_tokens || split_count <= 0) {
         if (kv_head < Geometry::KVHeads && column < group_end) { write_neutral(); }
         return;
@@ -575,7 +577,7 @@ __launch_bounds__((ColumnsPerBlock >= 4 ? 16 : kDecodeWarps * ColumnsPerBlock) *
             __syncthreads();
         }
 
-        if (local_warp < ProducerWarpsPerColumn) {
+        if (local_warp < ProducerWarpsPerColumn && compute_group) {
             float score[QKNtPerWarp][4];
 #pragma unroll
             for (int tile = 0; tile < QKNtPerWarp; ++tile) {
@@ -764,7 +766,7 @@ __launch_bounds__((ColumnsPerBlock >= 4 ? 16 : kDecodeWarps * ColumnsPerBlock) *
                     }
                 }
             }
-        } else {
+        } else if (local_warp >= ProducerWarpsPerColumn) {
             const int worker_warp =
                 group_lane * ValueStageWarpsPerColumn + local_warp - ProducerWarpsPerColumn;
             const int worker_tid = worker_warp * 32 + lane;
@@ -774,7 +776,7 @@ __launch_bounds__((ColumnsPerBlock >= 4 ? 16 : kDecodeWarps * ColumnsPerBlock) *
         }
         __syncthreads();
 
-        if (local_warp >= FirstPVWarp) {
+        if (local_warp >= FirstPVWarp && compute_group) {
             const int consumer_warp = local_warp - FirstPVWarp;
             const int output_tile   = consumer_warp * PVNtPerWarp;
             const float alpha0      = alpha_s[group_lane * Br + gid];
