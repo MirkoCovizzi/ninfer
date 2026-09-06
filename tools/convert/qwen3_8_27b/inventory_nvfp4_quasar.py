@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from . import inventory_nvfp4 as base
+from .dflash2_inventory import DFLASH2_TENSOR_SPECS
 
 
 MODEL_ID = base.MODEL_ID
@@ -80,12 +81,13 @@ DRAFT_HEAD_TENSOR_SPECS = base.DRAFT_HEAD_TENSOR_SPECS
 MTP_TENSOR_SPECS = base.MTP_TENSOR_SPECS
 VISION_TENSOR_SPECS = base.VISION_TENSOR_SPECS
 
-TENSOR_SPECS = (
+BASE_TENSOR_SPECS = (
     TEXT_CORE_TENSOR_SPECS
     + DRAFT_HEAD_TENSOR_SPECS
     + MTP_TENSOR_SPECS
     + VISION_TENSOR_SPECS
 )
+TENSOR_SPECS = BASE_TENSOR_SPECS + DFLASH2_TENSOR_SPECS
 OBJECT_SPECS: tuple[StoredObjectSpec, ...] = RESOURCE_SPECS + TENSOR_SPECS
 
 FORMAT_NAMES = (BF16, FP32, I32, Q4, Q5, Q6, W8, NVFP4, FP8)
@@ -132,23 +134,23 @@ def validate_inventory() -> None:
         len(NVFP4_TENSOR_SPECS),
         len(FP8_TENSOR_SPECS),
         len(INPUT_SCALE_DIVISOR_SPECS),
-    ) != (915, 2, 12, 333, 1262, 1268, 256, 0, 256):
+    ) != (915, 2, 12, 333, 1328, 1334, 256, 0, 256):
         raise ValueError("registered QUASAR NVFP4 inventory is incomplete")
     if FORMAT_COUNTS != {
-        BF16: 534,
+        BF16: 579,
         FP32: 352,
         I32: 1,
         Q4: 55,
         Q5: 54,
         Q6: 1,
-        W8: 9,
+        W8: 30,
         NVFP4: 256,
         FP8: 0,
     }:
         raise ValueError(f"unexpected QUASAR numeric allocation: {FORMAT_COUNTS}")
     if LAYOUT_COUNTS != {
-        CONTIGUOUS_LAYOUT: 887,
-        ROW_SPLIT_LAYOUT: 119,
+        CONTIGUOUS_LAYOUT: 932,
+        ROW_SPLIT_LAYOUT: 140,
         BLOCK_SCALE_LAYOUT: 256,
         ROW_SCALE_LAYOUT: 0,
     }:

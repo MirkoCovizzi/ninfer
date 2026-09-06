@@ -130,10 +130,12 @@ void verify_batch(ninfer::Engine& engine, KvProfile profile, std::uint32_t draft
 }
 
 void verify_route(const char* artifact, KvProfile profile, std::uint32_t draft_tokens,
-                  const std::vector<ninfer::TokenId>& expected) {
+                  const std::vector<ninfer::TokenId>& expected,
+                  std::uint32_t selected_concurrency = 0) {
     ninfer::Engine engine(
         engine_options(artifact, profile.storage, draft_tokens, kMaximumConcurrency));
     for (const std::uint32_t concurrency : kConcurrencyFrontiers) {
+        if (selected_concurrency != 0 && concurrency != selected_concurrency) continue;
         verify_batch(engine, profile, draft_tokens, concurrency, 0, expected);
         if (concurrency == kMaximumConcurrency) {
             verify_batch(engine, profile, draft_tokens, concurrency, 1, expected);
@@ -143,7 +145,7 @@ void verify_route(const char* artifact, KvProfile profile, std::uint32_t draft_t
 
 } // namespace
 
-int main() {
+int main(int argc, char** argv) {
     const char* artifact = std::getenv("NINFER_MTP_GREEDY_PARITY_WEIGHTS");
     if (artifact == nullptr || *artifact == '\0') {
         std::cout << "skip: NINFER_MTP_GREEDY_PARITY_WEIGHTS is not set\n";
@@ -151,11 +153,22 @@ int main() {
     }
 
     try {
+        const int selected_draft            = argc > 1 ? std::stoi(argv[1]) : -1;
+        const unsigned selected_concurrency = argc > 2 ? std::stoul(argv[2]) : 0;
+        const std::string_view selected_kv  = argc > 3 ? argv[3] : "";
+        if (argc > 4 || selected_draft < -1 || selected_draft > 5 || selected_concurrency > 8 ||
+            (!selected_kv.empty() && selected_kv != "bf16" && selected_kv != "int8")) {
+            throw std::invalid_argument("usage: greedy_parity_test [K C bf16|int8]");
+        }
         for (const KvProfile profile : kKvProfiles) {
+            if (!selected_kv.empty() && profile.name != selected_kv) continue;
             const std::vector<ninfer::TokenId> ordinary = generate(artifact, profile.storage, 0);
-            verify_route(artifact, profile, 0, ordinary);
+            if (selected_draft <= 0)
+                verify_route(artifact, profile, 0, ordinary, selected_concurrency);
             for (const std::uint32_t draft_tokens : kMtpDraftCounts) {
-                verify_route(artifact, profile, draft_tokens, ordinary);
+                if (selected_draft >= 0 && draft_tokens != static_cast<unsigned>(selected_draft))
+                    continue;
+                verify_route(artifact, profile, draft_tokens, ordinary, selected_concurrency);
             }
         }
     } catch (const std::exception& error) {

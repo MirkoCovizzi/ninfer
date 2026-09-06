@@ -19,6 +19,7 @@ using TokenId = std::int32_t;
 
 inline constexpr std::uint32_t kMaximumConcurrency               = 8;
 inline constexpr std::size_t kMaximumContextCacheSessionKeyBytes = 256;
+inline constexpr std::size_t kMaximumExplicitPromptCacheMarkers  = 4;
 // Aggregate encoded image/video payload retained by one prompt, independent of item count.
 inline constexpr std::size_t kMaximumPromptMediaBytes    = 256ULL << 20;
 inline constexpr std::size_t kDefaultMediaCacheBytes     = 1ULL << 30;
@@ -30,6 +31,13 @@ enum class KvCacheStorage : std::uint8_t {
     BFloat16,
     Int8Group64,
     Fp8E4M3Row256,
+    Nvfp4Group16,
+    Fp8KeyNvfp4Value,
+};
+
+enum class EnginePurpose : std::uint8_t {
+    Generation,
+    CausalScoring,
 };
 
 enum class KvCapacityMode : std::uint8_t {
@@ -64,22 +72,63 @@ enum class SpeculativeBackend : std::uint8_t {
     None,
     Mtp,
     DFlash,
+    DFlash2,
 };
 
 struct SpeculativeOptions {
     SpeculativeBackend backend = SpeculativeBackend::None;
+    // Startup-fixed K: MTP 1..5; DFlash and DFlash2 1..15 (query width K+1).
     std::uint32_t draft_tokens = 0;
     ProposalHead proposal_head = ProposalHead::Full;
 };
 
-struct LoadProgress {
-    std::function<void(std::string_view phase, std::uint64_t done, std::uint64_t total)> callback;
+enum class StartupPhase : std::uint8_t {
+    EngineStartup,
+    CudaInitialize,
+    ArtifactInspect,
+    TargetPlan,
+    WeightsMaterialize,
+    WeightsStagingPin,
+    TargetFinalize,
+    FrontendInitialize,
+    ProgramInitialize,
+    HostStatePin,
+    HostKvPin,
+    CudaGraphPrepare,
+    EngineFinalize,
+};
+
+enum class StartupStatus : std::uint8_t {
+    Begin,
+    Progress,
+    Complete,
+    Failed,
+};
+
+enum class StartupProgressUnit : std::uint8_t {
+    None,
+    Bytes,
+};
+
+struct StartupEvent {
+    StartupPhase phase                = StartupPhase::EngineStartup;
+    StartupStatus status              = StartupStatus::Begin;
+    StartupProgressUnit progress_unit = StartupProgressUnit::None;
+    std::uint64_t current             = 0;
+    std::uint64_t total               = 0;
+    std::uint64_t elapsed_ns          = 0;
+};
+
+struct StartupObserver {
+    // Startup diagnostics never participate in Engine control flow. Callback exceptions are
+    // ignored by the publishing boundary so a logging failure cannot invalidate model startup.
+    std::function<void(const StartupEvent& event)> callback;
 };
 
 struct ContextCacheOptions {
     // Engine resolves every optional once at construction. With C=max_concurrency, the enabled
-    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=C, L=2 and M=4; Engine::options() returns
-    // those effective values.
+    // defaults are H=C, R=8, Host KV=8 GiB, P=2C, S=max(C,4) and L=2;
+    // Engine::options() returns those effective values.
     bool enabled = true;
     // Extra Device checkpoint StateImage slots H. Total Device StateImage capacity is C + H.
     std::optional<std::uint32_t> device_state_slots;
@@ -90,8 +139,6 @@ struct ContextCacheOptions {
     std::optional<std::uint32_t> max_private_continuations;
     std::optional<std::uint32_t> max_shared_prefixes;
     std::optional<std::uint32_t> max_long_anchors_per_continuation;
-    // Input-complexity bound; this does not reserve checkpoint storage.
-    std::optional<std::uint32_t> max_cache_markers_per_request;
 };
 
 struct ContextCostOptions {
@@ -103,8 +150,9 @@ struct ContextCostOptions {
 
 struct EngineOptions {
     std::filesystem::path artifact_path;
+    EnginePurpose purpose              = EnginePurpose::Generation;
     int device                         = 0;
-    std::uint32_t max_context          = 2048; // Exact logical ceiling of each request.
+    std::uint32_t max_context          = 2048; // Logical ceiling of one request or score window.
     KvCapacityPolicy kv_capacity       = KvCapacityPolicy::explicit_capacity(2048);
     std::uint32_t max_concurrency      = 1;
     std::uint32_t max_pending_requests = 16;
@@ -120,7 +168,7 @@ struct EngineOptions {
     bool use_cuda_graph                    = true;
     ContextCacheOptions context_cache;
     ContextCostOptions context_cost;
-    LoadProgress load_progress;
+    StartupObserver startup_observer;
 };
 
 enum class SamplingMode : std::uint8_t {
@@ -247,6 +295,48 @@ struct GeneratedToolCall {
     std::string arguments_json;
 };
 
+// Terminal interpretation of model-origin tool-call markup. Parameter schemas guide JSON
+// normalization but do not validate the call; only a structure/identity failure can return a
+// complete marker region to ordinary content.
+enum class ToolCallParseFallbackReason : std::uint8_t {
+    None,
+    MalformedStructure,
+    DuplicateParameter,
+    InvalidToolName,
+    UndeclaredTool,
+    TrailingContent,
+};
+
+[[nodiscard]] inline constexpr const char*
+tool_call_parse_fallback_reason_name(ToolCallParseFallbackReason reason) noexcept {
+    switch (reason) {
+    case ToolCallParseFallbackReason::None:
+        return "none";
+    case ToolCallParseFallbackReason::MalformedStructure:
+        return "malformed_structure";
+    case ToolCallParseFallbackReason::DuplicateParameter:
+        return "duplicate_parameter";
+    case ToolCallParseFallbackReason::InvalidToolName:
+        return "invalid_tool_name";
+    case ToolCallParseFallbackReason::UndeclaredTool:
+        return "undeclared_tool";
+    case ToolCallParseFallbackReason::TrailingContent:
+        return "trailing_content";
+    }
+    return "malformed_structure";
+}
+
+struct ToolCallParseDiagnostics {
+    bool marker_seen                            = false;
+    std::uint32_t structured_call_count         = 0;
+    std::uint32_t empty_arguments_omitted       = 0;
+    std::uint32_t schema_mismatch_arguments     = 0;
+    ToolCallParseFallbackReason fallback_reason = ToolCallParseFallbackReason::None;
+
+    [[nodiscard]] friend constexpr bool
+    operator==(const ToolCallParseDiagnostics&, const ToolCallParseDiagnostics&) noexcept = default;
+};
+
 // Wire-independent conversation authority. Protocol adapters preserve these roles and their
 // ordering; a target frontend owns any model-specific role lowering.
 enum class ChatRole : std::uint8_t {
@@ -331,6 +421,32 @@ enum class PromptCacheMarkerKind : std::uint8_t {
     PrivateLongAnchor,
 };
 
+enum class SharedCandidateEvidence : std::uint8_t {
+    None               = 0,
+    ExplicitBoundary   = 1U << 0U,
+    RequestedAutomatic = 1U << 1U,
+    DefaultAutomatic   = 1U << 2U,
+    EngineStructural   = 1U << 3U,
+    EngineObserved     = 1U << 4U,
+};
+
+[[nodiscard]] constexpr SharedCandidateEvidence operator|(SharedCandidateEvidence left,
+                                                          SharedCandidateEvidence right) noexcept {
+    return static_cast<SharedCandidateEvidence>(static_cast<std::uint8_t>(left) |
+                                                static_cast<std::uint8_t>(right));
+}
+
+constexpr SharedCandidateEvidence& operator|=(SharedCandidateEvidence& left,
+                                              SharedCandidateEvidence right) noexcept {
+    left = left | right;
+    return left;
+}
+
+[[nodiscard]] constexpr bool has_shared_candidate_evidence(SharedCandidateEvidence value,
+                                                           SharedCandidateEvidence evidence) {
+    return (static_cast<std::uint8_t>(value) & static_cast<std::uint8_t>(evidence)) != 0;
+}
+
 enum class PromptCacheMarkerLocation : std::uint8_t {
     MessageBoundary,
     MessagePartBoundary,
@@ -341,6 +457,7 @@ enum class PromptCacheMarkerLocation : std::uint8_t {
 struct PromptCacheMarker {
     std::uint32_t after_message_count  = 0;
     PromptCacheMarkerKind kind         = PromptCacheMarkerKind::SharedStablePrefix;
+    SharedCandidateEvidence evidence   = SharedCandidateEvidence::ExplicitBoundary;
     PromptCacheMarkerLocation location = PromptCacheMarkerLocation::MessageBoundary;
     // Byte count within the untrimmed leading System/Developer message.
     std::uint32_t leading_instruction_bytes = 0;
@@ -357,6 +474,9 @@ struct ContextCacheHints {
     std::optional<std::string> session_key;
     CacheRetentionHint retention = CacheRetentionHint::Default;
     std::vector<PromptCacheMarker> markers;
+    // Protocols with their own automatic/explicit write policy disable the Engine's structural
+    // candidates. Exact reads from already-published shared prefixes remain enabled.
+    bool allow_engine_automatic_shared_prefixes = true;
     // Advance the named session lineage when session_key is present. This does not require an
     // anonymous content-matched source to be retained.
     bool update_session_index = true;
@@ -451,16 +571,46 @@ struct GenerationStart {
     std::uint32_t reused_prompt_tokens = 0;
 };
 
+// Cumulative prompt frontier published only after the corresponding Program work has completed.
+// The Engine owns the request-relative clock and accounting; protocol adapters choose names and
+// units for the wire representation.
+struct PromptProgress {
+    std::uint32_t total_prompt_tokens     = 0;
+    std::uint32_t reused_prompt_tokens    = 0;
+    std::uint32_t processed_prompt_tokens = 0;
+    std::uint64_t elapsed_ns              = 0;
+};
+
+// Cumulative timing snapshot at one stable output-commit boundary. Generated tokens count model
+// and Engine-injected tokens accepted into the sequence, independently of whether the Frontend has
+// enough visible bytes to publish an OutputDelta for that boundary.
+struct GenerationTimingObservation {
+    std::uint32_t generated_tokens      = 0;
+    std::uint64_t prompt_elapsed_ns     = 0;
+    std::uint64_t generation_elapsed_ns = 0;
+};
+
 class OutputSink {
 public:
-    virtual ~OutputSink()                     = default;
-    virtual void start(GenerationStart start) = 0;
-    virtual void publish(OutputDelta delta)   = 0;
+    virtual ~OutputSink()                                   = default;
+    virtual void start(GenerationStart start)               = 0;
+    virtual void progress(PromptProgress progress)          = 0;
+    virtual void timing(GenerationTimingObservation timing) = 0;
+    virtual void publish(OutputDelta delta)                 = 0;
 };
 
 enum class OutputConsumerMode : std::uint8_t {
     Aggregate,
     Streaming,
+};
+
+// Observation affects only request publication. It never changes model execution, output
+// semantics, scheduling, or cache selection. Live observations require a Streaming consumer;
+// phase timings may also be retained for an Aggregate terminal response.
+struct GenerationObservationOptions {
+    bool phase_timings   = false;
+    bool live_timings    = false;
+    bool prompt_progress = false;
 };
 
 class CancellationView {
@@ -491,7 +641,12 @@ struct GenerationTimings {
     double vision_seconds      = 0.0;
     double prefill_seconds     = 0.0;
     double decode_seconds      = 0.0;
-    double total_seconds       = 0.0;
+    // Request wall phases at committed model-state boundaries. Prompt begins when admission and
+    // its exact reuse choice are published and ends at the first accepted output token. Generation
+    // spans the first through last accepted output token and therefore has N-1 token intervals.
+    double prompt_wall_seconds     = 0.0;
+    double generation_wall_seconds = 0.0;
+    double total_seconds           = 0.0;
 };
 
 // Wall elapsed time directly observed in Engine-owned regions. "Exposed" values are latency
@@ -542,12 +697,9 @@ enum class PrefixReusePath : std::uint8_t {
     SharedStablePrefix,
 };
 
-// Why pressure planning stopped for the materialization decision committed to one request.
-// "ModelOptimal" is relative to the configured target graph, canonical transaction order, and
-// numerical cost model; it is not a claim about globally optimal observed TTFT.
+// Why bounded pressure planning stopped for the materialization decision committed to one request.
 enum class MaterializationStopReason : std::uint8_t {
     NoPressure,
-    ModelOptimal,
     QueueExhausted,
     TargetBudget,
     ExpansionCapacity,
@@ -560,8 +712,6 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
     switch (reason) {
     case MaterializationStopReason::NoPressure:
         return "no_pressure";
-    case MaterializationStopReason::ModelOptimal:
-        return "model_optimal";
     case MaterializationStopReason::QueueExhausted:
         return "queue_exhausted";
     case MaterializationStopReason::TargetBudget:
@@ -577,21 +727,17 @@ materialization_stop_reason_name(MaterializationStopReason reason) noexcept {
 }
 
 struct MaterializationDiagnostics {
-    std::uint64_t predicted_now_ns              = 0;
-    std::uint64_t predicted_future_loss_ns      = 0;
-    std::uint64_t predicted_total_ns            = 0;
-    std::uint32_t targets_evaluated             = 0;
-    std::uint64_t projection_work               = 0;
-    std::uint64_t planning_elapsed_ns           = 0;
-    std::uint64_t search_elapsed_ns             = 0;
-    MaterializationStopReason stop_reason       = MaterializationStopReason::NoPressure;
-    bool model_optimal                          = true;
-    bool budget_exhausted                       = false;
-    std::uint64_t best_remaining_lower_bound_ns = 0;
-    std::uint64_t absolute_bound_gap_ns         = 0;
-    double relative_bound_gap                   = 0.0;
-    std::uint32_t selected_degradation_units    = 0;
-    bool selected_maximal_fallback              = false;
+    std::uint64_t predicted_now_ns           = 0;
+    std::uint64_t predicted_future_loss_ns   = 0;
+    std::uint64_t predicted_total_ns         = 0;
+    std::uint32_t targets_evaluated          = 0;
+    std::uint64_t projection_work            = 0;
+    std::uint64_t planning_elapsed_ns        = 0;
+    std::uint64_t search_elapsed_ns          = 0;
+    MaterializationStopReason stop_reason    = MaterializationStopReason::NoPressure;
+    bool budget_exhausted                    = false;
+    std::uint32_t selected_degradation_units = 0;
+    bool selected_maximal_fallback           = false;
 
     [[nodiscard]] friend constexpr bool
     operator==(const MaterializationDiagnostics&,
@@ -604,6 +750,7 @@ struct GenerationResult {
     std::string content;
     std::string reasoning;
     std::vector<GeneratedToolCall> tool_calls;
+    ToolCallParseDiagnostics tool_call_parse;
     std::uint32_t reasoning_tokens = 0;
     FinishReason finish_reason     = FinishReason::None;
     std::optional<std::string> matched_stop_string;
