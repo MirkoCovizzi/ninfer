@@ -23,6 +23,8 @@ DFlashFeatureSink make_dflash_prefill_sink(PrefillContext& state) {
             Tensor count = frame.append_counts.slice(0, 0, 1);
             Tensor lane  = frame.state_destination_slots.slice(0, 0, 1);
             Tensor row   = frame.dflash_kv_table_rows.slice(0, 0, 1);
+            // A checkpoint fork can move the active StateImage between prefill chunks.
+            ops::set_i32_scalar(lane, state.state_destination_slot, state.execution.device.stream);
             ops::set_i32_scalar(count, features.ne[1], state.execution.device.stream);
             const auto exact = static_cast<std::uint32_t>(features.ne[1]);
             dflash_append_context(state, features, positions, count, lane, row, {exact, exact});

@@ -104,6 +104,52 @@ int main(int argc, char** argv) {
         options.speculative.draft_tokens = k;
         options.speculative.proposal_head =
             optimized ? ninfer::ProposalHead::Optimized : ninfer::ProposalHead::Full;
+        // Keep prompt splits fixed while changing checkpoint placement. Drafter suffix writes
+        // must follow a Device fork to its new slot, just as they follow a Host snapshot in place.
+        std::vector<ninfer::TokenId> host_capture_tokens;
+        for (const unsigned device_slots : {0U, 1U}) {
+            auto capture_options            = options;
+            capture_options.max_concurrency = 1;
+            capture_options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304);
+            capture_options.enable_vision   = false;
+            capture_options.context_cache.device_state_slots  = device_slots;
+            capture_options.context_cache.host_state_slots    = 8;
+            capture_options.context_cache.max_shared_prefixes = 0;
+            ninfer::Engine capture_engine(capture_options);
+            ninfer::ChatMessage user;
+            user.role = ninfer::ChatRole::User;
+            user.parts.push_back(
+                {.kind = ninfer::MessagePartKind::Text,
+                 .text =
+                     "\nSolve the following math problem step by step. Put your answer inside "
+                     "\\boxed{}.\n\n"
+                     "Six points $A, B, C, D, E,$ and $F$ lie in a straight line in that order. "
+                     "Suppose that $G$ is a point not on the line and that $AC=26, BD=22, CE=31, "
+                     "DF=33, AF=73, CG=40,$ and $DG=30.$ Find the area of $\\triangle BGE.$\n\n"
+                     "Remember to put your answer inside \\boxed{}.",
+                 .media = {}});
+            ninfer::PromptInput input;
+            input.messages.push_back(std::move(user));
+            input.options.enable_thinking                  = true;
+            auto sampled_capture                           = request(128, true);
+            sampled_capture.execution.sampling.temperature = 1.0F;
+            sampled_capture.execution.sampling.top_p       = 0.95F;
+            sampled_capture.execution.sampling.top_k       = 20;
+            sampled_capture.execution.sampling.seed        = 42;
+            const auto result =
+                capture_engine.generate(capture_engine.prepare(input), sampled_capture);
+            valid(result, 128);
+            const auto capture_stats = capture_engine.runtime_stats();
+            require(device_slots == 0 ? capture_stats.state_d2h_count > 0
+                                      : capture_stats.state_forks > 0,
+                    "sampled capture fixture did not exercise its StateImage placement");
+            if (device_slots == 0) {
+                host_capture_tokens = result.generated_token_ids;
+            } else {
+                require(result.generated_token_ids == host_capture_tokens,
+                        "DFlash2 sampled output changed across Host/Device checkpoint placement");
+            }
+        }
         ninfer::Engine engine(options);
         ninfer::test::speculative_page_boundary(engine);
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
