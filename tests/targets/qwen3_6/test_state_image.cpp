@@ -32,7 +32,8 @@ struct PlannedPool {
     std::size_t bytes = 0;
 };
 
-PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool kvarn = false) {
+PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool dflash2 = false,
+                      bool kvarn = false) {
     q36::StateImageSpec spec{
         .linear =
             {
@@ -48,8 +49,13 @@ PlannedPool plan_pool(bool dflash, std::int32_t slots = 4, bool kvarn = false) {
         .hidden = 7,
     };
     if (dflash) {
-        spec.dflash_local =
-            q36::DFlashLocalStateSpec{.layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
+        spec.dflash_local = dflash2
+                                ? q36::DFlashLocalStateSpec{.layers   = 5,
+                                                            .capacity = 2048,
+                                                            .kv_heads = 8,
+                                                            .head_dim = 128}
+                                : q36::DFlashLocalStateSpec{
+                                      .layers = 2, .capacity = 17, .kv_heads = 2, .head_dim = 4};
     }
     if (kvarn) {
         spec.kvarn = q36::KvarnContinuationStateSpec{
@@ -172,8 +178,14 @@ void expect_zero_slot(q36::StateImageDevicePool& pool, std::int32_t slot, std::s
     }
 }
 
-void test_host_roundtrip(bool dflash, bool kvarn, ninfer::DeviceContext& device) {
-    PlannedPool planned = plan_pool(dflash, 2, kvarn);
+void test_host_roundtrip(bool dflash, ninfer::DeviceContext& device, bool dflash2 = false,
+                         bool kvarn = false) {
+    PlannedPool planned = plan_pool(dflash, 2, dflash2, kvarn);
+    if (dflash2) {
+        expect(q36::dflash_local_transfer_work(planned.layout.host).payload_bytes ==
+                   40ULL * 1024 * 1024,
+               "DFlash2 local snapshot must transfer exactly 40 MiB");
+    }
     ninfer::DeviceArena arena(planned.bytes);
     q36::StateImageDevicePool pool({arena.base(), arena.capacity()}, planned.layout);
     fill_slot(pool, 0, dflash ? 0x19 : 0x25);
@@ -251,9 +263,11 @@ int main() {
     expect_zero_slot(pool, 1, "StateImage zero complete destination");
     expect_slot(pool, 0, 0x11, "StateImage zero source isolation");
 
-    test_host_roundtrip(false, false, device);
-    test_host_roundtrip(true, false, device);
-    test_host_roundtrip(false, true, device);
+    test_host_roundtrip(false, device);
+    test_host_roundtrip(true, device);
+    test_host_roundtrip(true, device, true);
+    test_host_roundtrip(false, device, false, true);
+    test_host_roundtrip(true, device, true, true);
 
     return failures == 0 ? 0 : 1;
 }

@@ -20,7 +20,7 @@ void launch_prefill(const Tensor& query, const Tensor& positions, const Tensor& 
                     const Tensor& table_rows, float scale, KvarnPagedBatchLayerView cache,
                     CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
                     Tensor& output, cudaStream_t stream) {
-    using Metadata = CausalPromptBatchMetadata<Masked>;
+    using Metadata = PagedKVBatchMetadata<Masked>;
     const Metadata metadata{
         .tables        = static_cast<const std::int32_t*>(cache.block_tables.data),
         .valid_columns = Masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
@@ -158,10 +158,10 @@ void decode_attention(const Tensor& query, const Tensor& positions, const Tensor
         query.ne[1] == CausalD256H24Kv4::QHeads && envelope.max_visible_keys > MtpPackedWindow ? 8
                                                                                                : 6;
     for (int begin = 0; begin < query.ne[2]; begin += kChunk) {
-        const int width = std::min(kChunk, query.ne[2] - begin);
-        auto scope      = workspace.scope();
-        int split_capacity =
-            ops::detail::causal_attention_split_capacity(query.ne[1], 1, DType::BF16, envelope);
+        const int width    = std::min(kChunk, query.ne[2] - begin);
+        auto scope         = workspace.scope();
+        int split_capacity = ops::detail::causal_attention_split_capacity(
+            query.ne[1], 1, KvCacheStorage::BFloat16, envelope);
         if (query.ne[1] == CausalD256H24Kv4::QHeads && envelope.max_visible_keys > 8198) {
             split_capacity = std::max(split_capacity, DecodeLongSplits);
         }

@@ -274,7 +274,7 @@ def validate_recipe() -> None:
         if all_names.intersection(names):
             raise ValueError("more than one source route owns an artifact tensor")
         all_names.update(names)
-    if all_names != {spec.name for spec in inventory.TENSOR_SPECS}:
+    if all_names != {spec.name for spec in inventory.BASE_TENSOR_SPECS}:
         raise ValueError("source routes do not cover the QUASAR tensor inventory")
     if tuple(NVFP4_WEIGHTS_BY_NAME) != tuple(
         spec.name for spec in inventory.NVFP4_TENSOR_SPECS

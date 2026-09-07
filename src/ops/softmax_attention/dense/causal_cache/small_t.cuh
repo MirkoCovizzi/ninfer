@@ -101,10 +101,10 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
     if constexpr (Int8) {
         if (tokens == 5 && window > 128 && window <= 512) {
             splits = div_up(window, 32 / Geometry::SmallTSplitScale);
-        } else if (tokens == 6 && window > 128 && window <= 160) {
+        } else if (tokens >= 6 && window > 128 && window <= 160) {
             constexpr int kKeysPerSplit = Geometry::SmallTSplitScale == 2 ? 17 : 24;
             splits                      = div_up(window, kKeysPerSplit);
-        } else if (tokens == 6 && window > 5000 && window <= 8198) {
+        } else if (tokens >= 6 && window > 5000 && window <= 8198) {
             splits             = div_up(window, 192 / Geometry::SmallTSplitScale);
             constexpr int kMin = 4 * Geometry::SmallTSplitScale;
             constexpr int kMax = 42 * Geometry::SmallTSplitScale;
@@ -120,8 +120,8 @@ __device__ __forceinline__ int causal_small_t_active_splits(int window, int laun
 }
 
 template <typename Geometry>
-__device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int launch_capacity,
-                                                                int tokens) {
+__device__ __forceinline__ int
+causal_small_t_quantized_active_splits(int window, int launch_capacity, int tokens) {
     int splits = causal_small_t_default_splits<Geometry>(window);
     if constexpr (Geometry::SmallTSplitScale == 1) {
         if (tokens == 1 && window > 8198) { splits = Geometry::SmallTMaximumSplits; }
@@ -131,6 +131,15 @@ __device__ __forceinline__ int causal_small_t_fp8_active_splits(int window, int 
 
 __device__ __forceinline__ int causal_small_t_tc_swz(int row, int col) {
     return (((col >> 3) ^ (row & 7)) << 3) | (col & 7);
+}
+
+template <typename Byte>
+__device__ __forceinline__ void causal_small_t_store_byte_swizzled(Byte* tile, int row, int d,
+                                                                   int d_b16_stride, Byte code) {
+    const int col_b16 = d >> 1;
+    const int byte    = d & 1;
+    const int off     = (row * d_b16_stride + causal_small_t_tc_swz(row, col_b16)) * 2 + byte;
+    tile[off]         = code;
 }
 
 __device__ __forceinline__ int causal_small_t_tc_swz32(int row, int col) {
@@ -153,9 +162,40 @@ __device__ __forceinline__ void causal_small_t_tc_row_to_qt(int row, int tokens,
     q_head            = kv_head * Geometry::GroupSize + local_q;
 }
 
+// Merge one query/head's split statistics once per CTA. Published scalars are separate
+// from the reduction/weight storage, so later writes cannot race another warp's scalar read.
+template <class Geometry>
+__device__ __forceinline__ float
+causal_merge_split_statistics(const float* partial_m, const float* partial_l, int q_head, int token,
+                              int tokens, int splits, float* weights, float* warp_sums,
+                              float* scalars) {
+    static_assert(Geometry::SmallTMaximumSplits <= 256);
+    const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+    const auto index   = causal_partial_stat_index<Geometry>(q_head, token, tid, tokens);
+    const float m      = tid < splits ? partial_m[index] : -CUDART_INF_F;
+    const float warp_m = warp_max(m);
+    if (lane == 0) warp_sums[warp] = warp_m;
+    __syncthreads();
+    if (warp == 0) {
+        const float maximum = warp_max(tid < 8 ? warp_sums[tid] : -CUDART_INF_F);
+        if (tid == 0) scalars[0] = maximum;
+    }
+    __syncthreads();
+    const float maximum     = scalars[0];
+    const float l           = tid < splits ? partial_l[index] : 0.0f;
+    const float weight      = l > 0.0f && maximum > -CUDART_INF_F ? expf(m - maximum) : 0.0f;
+    const float denominator = block_reduce_sum<256>(l * weight, warp_sums);
+    if (tid == 0) scalars[1] = denominator;
+    __syncthreads();
+    const float total = scalars[1];
+    if (tid < splits) weights[tid] = total > 0.0f ? weight : 0.0f;
+    __syncthreads();
+    return total;
+}
+
 template <typename Geometry, int DChunk, bool Int8, bool MultiBatch, bool Masked, bool Offset>
 __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_kernel(
-    const void* partial_acc, const float* partial_m, const float* partial_l,
+    const float* partial_acc, const float* partial_m, const float* partial_l,
     const std::int32_t* positions, const std::int32_t* valid_columns, std::int32_t tokens,
     std::int32_t full_width, std::int32_t column_begin, std::int32_t batch_size,
     std::int32_t split_count, __nv_bfloat16* out) {
@@ -178,15 +218,24 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
 
     if constexpr (Offset) { positions += column_begin; }
     if constexpr (MultiBatch) { positions += batch * full_width; }
-    const int last_pos = positions[tokens - 1];
+    const int last_pos = positions[Int8 ? tokens - 1 : token];
     int output_column  = token;
     if constexpr (Offset) { output_column += column_begin; }
     if constexpr (MultiBatch) { output_column += batch * full_width; }
+    if constexpr (Masked) {
+        const int absolute_column = token + (Offset ? column_begin : 0);
+        if (absolute_column >= valid_columns[batch]) {
+            if (tid < DChunk && d_start + tid < kCausalHeadDim)
+                out[causal_q_index<Geometry>(q_head, d_start + tid, output_column)] =
+                    __float2bfloat16(0.0f);
+            return;
+        }
+    }
 
-    std::int64_t partial_acc_offset = 0;
+
     if constexpr (MultiBatch) {
-        partial_acc_offset = static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
-                             tokens * split_count;
+        partial_acc += static_cast<std::int64_t>(batch) * kCausalHeadDim * Geometry::QHeads *
+                       tokens * split_count;
         const std::int64_t partial_stat_row =
             static_cast<std::int64_t>(batch) * Geometry::QHeads * tokens * split_count;
         partial_m += partial_stat_row;
@@ -197,81 +246,21 @@ __launch_bounds__(256) __global__ void causal_attention_small_t_reduce_output_ke
     const int active_split_count =
         causal_small_t_active_splits<Geometry, Int8>(window, split_count, tokens);
 
-    __shared__ float reduce[256];
-
-    float local_m = -CUDART_INF_F;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        local_m = fmaxf(
-            local_m, partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)]);
-    }
-    reduce[tid] = local_m;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] = fmaxf(reduce[tid], reduce[tid + stride]); }
-        __syncthreads();
-    }
-    const float head_m = reduce[0];
-    __syncthreads();
-
-    if (head_m == -CUDART_INF_F) {
-        const int d = d_start + tid;
-        if (tid < DChunk && d < kCausalHeadDim) {
-            out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(0.0f);
-        }
-        return;
-    }
-
-    float local_l = 0.0f;
-    for (int split = tid; split < active_split_count; split += blockDim.x) {
-        const float tile_l =
-            partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-        if (tile_l > 0.0f) {
-            local_l +=
-                tile_l *
-                expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
-        }
-    }
-    reduce[tid] = local_l;
-    __syncthreads();
-
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (tid < stride) { reduce[tid] += reduce[tid + stride]; }
-        __syncthreads();
-    }
-    const float head_l = reduce[0];
-
+    __shared__ float weights[256], warp_sums[8], scalars[2];
+    const float head_l =
+        causal_merge_split_statistics<Geometry>(partial_m, partial_l, q_head, token, tokens,
+                                                active_split_count, weights, warp_sums, scalars);
     const int d = d_start + tid;
-    if (tid >= DChunk || d >= kCausalHeadDim) { return; }
-
+    if (tid >= DChunk || d >= kCausalHeadDim) return;
     float numerator = 0.0f;
-    if (head_l > 0.0f) {
-        for (int split = 0; split < active_split_count; ++split) {
-            const float tile_l =
-                partial_l[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)];
-            if (tile_l <= 0.0f) { continue; }
-            const float weight =
-                expf(partial_m[causal_partial_stat_index<Geometry>(q_head, token, split, tokens)] -
-                     head_m);
-            const std::int64_t index = partial_acc_offset + causal_partial_acc_index<Geometry>(
-                                                                q_head, d, token, split, tokens);
-            float partial = 0.0f;
-            if constexpr (Int8) {
-                partial = static_cast<const float*>(partial_acc)[index];
-            } else {
-                partial = __bfloat162float(static_cast<const __nv_bfloat16*>(partial_acc)[index]);
-            }
-            numerator += partial * weight;
-        }
+    for (int split = 0; split < active_split_count; ++split) {
+        if (weights[split] != 0.0f)
+            numerator +=
+                partial_acc[causal_partial_acc_index<Geometry>(q_head, d, token, split, tokens)] *
+                weights[split];
     }
-    bool valid = true;
-    if constexpr (Masked) {
-        int absolute_column = token;
-        if constexpr (Offset) { absolute_column += column_begin; }
-        valid = absolute_column < valid_columns[batch];
-    }
-    const float value = (valid && head_l > 0.0f) ? numerator / head_l : 0.0f;
+
+    const float value = (head_l > 0.0f) ? numerator / head_l : 0.0f;
     out[causal_q_index<Geometry>(q_head, d, output_column)] = __float2bfloat16(value);
 }
 

@@ -25,6 +25,7 @@ from tools.convert.qwen3_6_27b import convert as family_config
 from tools.convert.qwen3_6_27b import draft_head
 
 from . import convert as base_convert
+from . import dflash2_recipe
 from . import convert_nvfp4 as mixed_converter
 from . import inventory_nvfp4_quasar as inventory
 from . import recipe_nvfp4_quasar as recipe
@@ -47,9 +48,12 @@ _IGNORED_TARGETS = [
 class ConversionPreflight:
     official_dir: Path
     quantized_dir: Path
+    dflash2_model_dir: Path
     config_summary: dict[str, object]
+    dflash2_config_summary: dict[str, object]
     official_source: family_recipe.SourcePreflight
     quantized_source: family_recipe.SourcePreflight
+    dflash2_source: family_recipe.SourcePreflight
     resources: tuple[family_conversion.ResourcePayload, ...]
     draft: draft_head.DraftHeadContext
     object_plan: family_conversion.ObjectPlan
@@ -131,6 +135,7 @@ def _validate_quantized_config(
 def preflight_inventory() -> None:
     inventory.validate_inventory()
     recipe.validate_recipe()
+    dflash2_recipe.validate_recipe_coverage()
 
 
 def build_object_plan(
@@ -143,9 +148,11 @@ def build_object_plan(
 def preflight_conversion(
     official_dir: str | Path,
     quantized_dir: str | Path,
+    dflash2_model_dir: str | Path,
 ) -> ConversionPreflight:
     official = Path(official_dir)
     quantized = Path(quantized_dir)
+    dflash2_model = Path(dflash2_model_dir)
     mixed_converter._validate_index(official)
     mixed_converter._validate_index(quantized)
 
@@ -158,6 +165,11 @@ def preflight_conversion(
     )
     if official_summary != quantized_summary:
         raise ValueError("official and QUASAR source model configs do not match")
+    dflash2_summary = dflash2_recipe.validate_config(
+        family_conversion.load_json(dflash2_model / "config.json")
+    )
+    dflash2_recipe.validate_base_compatibility(official_summary, dflash2_summary)
+    dflash2_source = dflash2_recipe.preflight_sources(dflash2_model)
     preflight_inventory()
 
     with ShardReader(official) as official_reader:
@@ -174,9 +186,12 @@ def preflight_conversion(
     return ConversionPreflight(
         official_dir=official,
         quantized_dir=quantized,
+        dflash2_model_dir=dflash2_model,
         config_summary=official_summary,
+        dflash2_config_summary=dflash2_summary,
         official_source=official_source,
         quantized_source=quantized_source,
+        dflash2_source=dflash2_source,
         resources=resources,
         draft=draft,
         object_plan=object_plan,
@@ -222,7 +237,7 @@ def _build_report(
         model_dir=preflight.official_dir,
         out_path=output,
         arguments=arguments,
-        config_summary=preflight.config_summary,
+        config_summary={"base": preflight.config_summary, "dflash2": preflight.dflash2_config_summary},
         source_preflight=preflight.official_source,
         objects=objects,
         elapsed_seconds=elapsed_seconds,
@@ -240,6 +255,11 @@ def _build_report(
             "repository": recipe.QUANTIZED_REPOSITORY,
             "revision": recipe.QUANTIZED_REVISION,
             "model_path": str(preflight.quantized_dir.resolve()),
+        },
+        "dflash2": {
+            "repository": dflash2_recipe.REPOSITORY,
+            "revision": dflash2_recipe.REVISION,
+            "model_path": str(preflight.dflash2_model_dir.resolve()),
         },
         "ranking_path": str(ranking.resolve()),
     }
@@ -260,6 +280,12 @@ def _build_report(
             "bf16_control_matrices": len(recipe.CONTROL_SOURCES),
         },
     }
+    report["source_preflight"]["dflash2"] = {
+        "recipes": preflight.dflash2_source.recipe_count,
+        "tensors": preflight.dflash2_source.source_tensor_count,
+        "shards": preflight.dflash2_source.source_shard_count,
+        "dtypes": dict(preflight.dflash2_source.source_dtype_counts),
+    }
     report["source_profile"] = "quasar-all-linear-nvfp4"
     return report
 
@@ -267,6 +293,7 @@ def _build_report(
 def convert(
     official_dir: str | Path,
     quantized_dir: str | Path,
+    dflash2_model_dir: str | Path,
     out_path: str | Path,
     *,
     device: str | torch.device = "cuda",
@@ -279,7 +306,7 @@ def convert(
         )
     requested_device = str(device)
     resolved_device = pick_device(device)
-    preflight = preflight_conversion(official_dir, quantized_dir)
+    preflight = preflight_conversion(official_dir, quantized_dir, dflash2_model_dir)
 
     print(
         f"preflight complete: {len(preflight.object_plan.objects)} objects, "
@@ -294,7 +321,9 @@ def convert(
     derived = {draft_head.DRAFT_HEAD_TOKEN_IDS_OBJECT: draft_ids}
     with ShardReader(preflight.official_dir) as official_reader, ShardReader(
         preflight.quantized_dir
-    ) as quantized_reader:
+    ) as quantized_reader, ShardReader.from_file(
+        preflight.dflash2_model_dir / "model.safetensors"
+    ) as dflash2_reader:
         with ArtifactWriter(
             output,
             ArtifactIdentity(inventory.MODEL_ID, inventory.WEIGHTS_ID),
@@ -306,6 +335,12 @@ def convert(
                 payload: bytes | Iterable[bytes]
                 if isinstance(spec, inventory.ResourceSpec):
                     payload = resources[spec.name]
+                elif spec.name.startswith("dflash2/"):
+                    tensor = _checked_shape(
+                        spec, dflash2_recipe.materialize_tensor(spec.name, dflash2_reader)
+                    )
+                    payload = family_conversion.encode_tensor_payload(tensor, spec, resolved_device)
+                    del tensor
                 elif spec.name in recipe.NVFP4_WEIGHTS_BY_NAME:
                     payload = _encode_nvfp4_weight(spec, quantized_reader)
                 elif spec.name in recipe.INPUT_DIVISORS_BY_NAME:
@@ -365,6 +400,7 @@ def convert(
     arguments = {
         "model": str(official_dir),
         "quantized_model": str(quantized_dir),
+        "dflash2_model": str(dflash2_model_dir),
         "out": str(out_path),
         "device": requested_device,
     }
@@ -392,12 +428,14 @@ def main(argv: Sequence[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model", required=True, type=Path)
     parser.add_argument("--quantized-model", required=True, type=Path)
+    parser.add_argument("--dflash2-model", required=True, type=Path)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--device", default="cuda")
     arguments = parser.parse_args(argv)
     convert(
         arguments.model,
         arguments.quantized_model,
+        arguments.dflash2_model,
         arguments.out,
         device=arguments.device,
     )

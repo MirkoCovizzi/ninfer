@@ -442,7 +442,7 @@ std::size_t kvarn_attention_workspace_capacity_bytes(std::int32_t query_heads,
     // The BF16 helper owns widths up to six; wider groups retain scalar split partitions.
     const std::int32_t capacity_width = decode_width > 6 ? 1 : decode_width;
     std::size_t decode                = causal_softmax_attention_workspace_capacity_bytes(
-        {kvarn::D, query_heads, kv_heads}, DType::BF16, envelope, batch_size,
+        {kvarn::D, query_heads, kv_heads}, KvCacheStorage::BFloat16, envelope, batch_size,
         std::min(min_width, capacity_width), capacity_width);
     if (decode_width > 6) { decode *= decode_width; }
     if (query_heads == 24 && envelope.max_visible_keys > 8198) {

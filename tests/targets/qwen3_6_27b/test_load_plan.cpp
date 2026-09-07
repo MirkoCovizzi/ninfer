@@ -6,6 +6,7 @@
 #include <ninfer/targets/qwen3_6/prepared_prompt.h>
 #include <ninfer/targets/qwen3_6_27b/package.h>
 
+#include <algorithm>
 #include <bit>
 #include <cmath>
 #include <cstdlib>
@@ -34,6 +35,32 @@ ninfer::targets::qwen3_6::StartupFeatures all_features() {
         .speculative   = ninfer::SpeculativeBackend::Mtp,
         .proposal_head = ninfer::ProposalHead::Optimized,
     };
+}
+
+ninfer::targets::qwen3_6::StartupFeatures
+features(ninfer::SpeculativeBackend backend,
+         ninfer::ProposalHead proposal_head = ninfer::ProposalHead::Full) {
+    return {
+        .vision        = false,
+        .speculative   = backend,
+        .proposal_head = proposal_head,
+    };
+}
+
+bool is_device_object(const ninfer::artifact::MaterializationPlan& plan,
+                      ninfer::artifact::ObjectHandle handle) {
+    return std::ranges::any_of(plan.device_objects, [handle](const auto& object) {
+        return object.object.index == handle.index;
+    });
+}
+
+std::size_t dflash2_device_objects(const ninfer::artifact::Reader& reader,
+                                   const ninfer::artifact::MaterializationPlan& plan) {
+    return static_cast<std::size_t>(
+        std::ranges::count_if(plan.device_objects, [&](const auto& item) {
+            return ninfer::artifact::object_name(reader.objects().at(item.object.index))
+                .starts_with("dflash2/");
+        }));
 }
 
 bool valid_divisors(const WeightPlan& weight) {
@@ -162,6 +189,74 @@ int verify_nvfp4(const std::filesystem::path& path, WeightsProfile expected_prof
     return 0;
 }
 
+int verify_legacy_dflash2_compatibility(const std::filesystem::path& path, WeightsProfile profile) {
+    {
+        ninfer::artifact::Reader reader(path);
+        ninfer::artifact::Binder binder(reader);
+        const ArtifactLoadPlan plan =
+            bind_artifact(binder, profile, features(ninfer::SpeculativeBackend::None));
+        if (plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
+            std::cerr << "legacy artifact unexpectedly bound DFlash2: " << path << '\n';
+            return 1;
+        }
+    }
+    {
+        ninfer::artifact::Reader reader(path);
+        ninfer::artifact::Binder binder(reader);
+        const ArtifactLoadPlan plan =
+            bind_artifact(binder, profile, features(ninfer::SpeculativeBackend::Mtp));
+        if (plan.bindings.dflash2 ||
+            !is_device_object(plan.materialization, plan.bindings.mtp.input_projection)) {
+            std::cerr << "legacy artifact did not preserve MTP-only binding: " << path << '\n';
+            return 1;
+        }
+    }
+    try {
+        ninfer::artifact::Reader reader(path);
+        ninfer::artifact::Binder binder(reader);
+        (void)bind_artifact(binder, profile, features(ninfer::SpeculativeBackend::DFlash2));
+    } catch (const ninfer::artifact::ArtifactError& error) {
+        if (std::string(error.what()).find("no DFlash2 weight bundle") != std::string::npos) {
+            return 0;
+        }
+    }
+    std::cerr << "legacy artifact did not reject selected DFlash2: " << path << '\n';
+    return 1;
+}
+
+int verify_dflash2_bundle(const std::filesystem::path& path, WeightsProfile profile) {
+    for (const ninfer::SpeculativeBackend backend :
+         {ninfer::SpeculativeBackend::None, ninfer::SpeculativeBackend::Mtp}) {
+        ninfer::artifact::Reader reader(path);
+        ninfer::artifact::Binder binder(reader);
+        const ArtifactLoadPlan plan = bind_artifact(binder, profile, features(backend));
+        if (!plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 0) {
+            std::cerr << "inactive DFlash2 bundle was not validate-only: " << path << '\n';
+            return 1;
+        }
+        const bool mtp_is_device =
+            is_device_object(plan.materialization, plan.bindings.mtp.input_projection);
+        if (mtp_is_device != (backend == ninfer::SpeculativeBackend::Mtp)) {
+            std::cerr << "MTP placement does not match backend selection: " << path << '\n';
+            return 1;
+        }
+    }
+
+    ninfer::artifact::Reader reader(path);
+    ninfer::artifact::Binder binder(reader);
+    const ArtifactLoadPlan plan = bind_artifact(
+        binder, profile,
+        features(ninfer::SpeculativeBackend::DFlash2, ninfer::ProposalHead::Optimized));
+    if (!plan.bindings.dflash2 || dflash2_device_objects(reader, plan.materialization) != 66 ||
+        is_device_object(plan.materialization, plan.bindings.mtp.input_projection) ||
+        !is_device_object(plan.materialization, plan.bindings.draft_head) ||
+        !is_device_object(plan.materialization, plan.bindings.draft_head_token_ids)) {
+        std::cerr << "selected DFlash2 bundle has the wrong placement: " << path << '\n';
+        return 1;
+    }
+    return 0;
+}
+
 int verify_qwen38_modern(const std::filesystem::path& path) {
     ninfer::artifact::Reader reader(path);
     if (Package::resolve_weights(reader) != WeightsProfile::Qwen38Nvfp4) {
@@ -194,7 +289,7 @@ int verify_qwen38_quasar(const std::filesystem::path& path) {
     ninfer::artifact::Binder binder(reader);
     const ArtifactLoadPlan plan =
         bind_artifact(binder, WeightsProfile::Qwen38Nvfp4Quasar, all_features());
-    if (plan.materialization.object_count != 1268 ||
+    if (plan.materialization.object_count != 1268 + (plan.bindings.dflash2 ? 66 : 0) ||
         plan.materialization.device_objects.size() != 1006 ||
         plan.materialization.host_objects.size() != 6) {
         std::cerr << "QUASAR materialization plan is incomplete\n";
@@ -249,7 +344,8 @@ int verify_profile_mismatch_rejection() {
     RuntimeModelView empty_model;
     try {
         (void)ninfer::targets::qwen3_6::create_program<Variant>(
-            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device);
+            empty_model, WeightsProfile::Qwen36Nvfp4, std::move(sequence), device,
+            ninfer::StartupObserver{});
     } catch (const std::invalid_argument& error) {
         if (std::string(error.what()).find("weights profile") != std::string::npos) { return 0; }
     }
@@ -307,9 +403,17 @@ int main() {
         artifact_path("NINFER_QWEN3_8_27B_QUASAR_NVFP4_WEIGHTS", "qwen3_8_27b_quasar_nvfp4.ninfer");
     bool ran = false;
     if (const int result = verify_profile_mismatch_rejection(); result != 0) { return result; }
-    if (std::filesystem::is_regular_file(groupwise) && std::filesystem::is_regular_file(nvfp4)) {
+    if (std::filesystem::is_regular_file(groupwise)) {
         ran = true;
         if (const int result = verify_groupwise(groupwise); result != 0) { return result; }
+        if (const int result =
+                verify_legacy_dflash2_compatibility(groupwise, WeightsProfile::Qwen36GroupwiseInt);
+            result != 0) {
+            return result;
+        }
+    }
+    if (std::filesystem::is_regular_file(nvfp4)) {
+        ran = true;
         if (const int result =
                 verify_nvfp4(nvfp4, WeightsProfile::Qwen36Nvfp4, NumericFormat::W8G32_F16S);
             result != 0) {
@@ -337,5 +441,24 @@ int main() {
         return 77;
     }
     if (const int result = verify_vision_workspace_planning(); result != 0) { return result; }
+    const std::filesystem::path qwen38_groupwise =
+        artifact_path("NINFER_QWEN3_8_27B_OLD_WEIGHTS", "qwen3_8_27b_old.ninfer");
+    const std::filesystem::path qwen38_nvfp4 =
+        artifact_path("NINFER_QWEN3_8_27B_NVFP4_OLD_WEIGHTS", "qwen3_8_27b_nvfp4_old.ninfer");
+    const std::filesystem::path qwen38_groupwise_dflash2 =
+        artifact_path("NINFER_QWEN3_8_27B_DFLASH2_WEIGHTS", "qwen3_8_27b.ninfer");
+    const std::filesystem::path qwen38_nvfp4_dflash2 =
+        artifact_path("NINFER_QWEN3_8_27B_NVFP4_DFLASH2_WEIGHTS", "qwen3_8_27b_nvfp4.ninfer");
+    for (const auto& path : {qwen38_legacy, qwen38_modern, qwen38_quasar, qwen38_groupwise,
+                             qwen38_nvfp4, qwen38_groupwise_dflash2, qwen38_nvfp4_dflash2}) {
+        if (!std::filesystem::is_regular_file(path)) continue;
+        ninfer::artifact::Reader reader(path);
+        ninfer::artifact::Binder binder(reader);
+        const auto profile = Package::resolve_weights(reader);
+        const int result   = binder.contains("dflash2/feature_projection")
+                                 ? verify_dflash2_bundle(path, profile)
+                                 : verify_legacy_dflash2_compatibility(path, profile);
+        if (result != 0) return result;
+    }
     return 0;
 }
