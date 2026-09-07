@@ -19,7 +19,44 @@ cmake --build build --parallel --target ninfer_bench
 
 ## Product benchmark
 
-The benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
+For KVarN, use at least 128 decode tokens and include non-page-aligned prompt lengths so the
+measurement includes periodic 128-token group encoding and speculative group-boundary handling.
+Record acceptance alongside throughput; a short, all-accepted run is not representative of every
+MTP workload.
+
+`ninfer_kvarn_attention_bench --context N` measures cached attention, committed append, provisional
+widths 1 through 6, and a prefill append-and-attend chunk ending at visible context `N`. Each sample
+restores Q/K/V and the exact pre-append cache state outside the timed interval. `closes_page=1`
+identifies samples containing page-closing Sinkhorn work. Compare, for example, `--context 8192`
+with `--context 8198` to distinguish closure cost from ordinary small-width append cost. Do not interpret the
+former as an amortized per-token latency.
+
+Use `--phase cached|append|provisional|prefill` and `--width 1..16` to isolate a decode/append
+case for kernel profiling; omit `--width` for the 1,024-token prefill case. `--batch 1..8` uses
+independent cache rows with equal context lengths; prefill is measured only at batch one.
+Provisional cases supply explicit valid-column counts and include all-valid acceptance/commit,
+as a complete accepted Engine round does. Multi-row cases use
+the runtime's conservative lower execution-envelope bound by default. `--tight-envelope` instead
+uses the exact common frontier to measure launch overprovisioning on this homogeneous fixture;
+it is not a production optimization or evidence that arbitrary mixed-row graphs can use that bound.
+Explicit widths 7..16 select provisional Op calls; the default sweep remains 1..6. These wider
+H24/KV4 calls use eight-column chunks above 1,024 visible keys, not an Engine MTP depth above five.
+
+```bash
+./build/bench/ninfer_kvarn_attention_bench --context 196614 --phase provisional --width 4
+./build/bench/ninfer_kvarn_attention_bench --context 32774 --phase provisional --width 4 --batch 2
+```
+
+**KVarN Qualification**
+
+The K4V2-G128 mathematical contract and execution checks are maintained in
+[`paged-kv-cache.md`](../docs/maintainer/paged-kv-cache.md#execution-regression).
+The native implementation retains scalar/four/eight-column decode and stages G128 records in
+64-token slices. Current-step values remain unquantized through attention; group encoding occurs
+after commitment. Performance results for the previous G64/early-encoding path do not qualify
+this implementation. Measure the current preset and report acceptance with throughput.
+
+The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not
 have a private prefill/decode loop and does not call target implementation interfaces.
 
@@ -48,7 +85,7 @@ ninfer_bench --weights <artifact.ninfer>
           [-pg, --prompt-gen <P,G;P,G...>]
           [-r, --repetitions <n>] [--warmup <n>]
           [--max-ctx <tokens>] [--prefill-chunk <tokens>]
-          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4>]
+          [--kv-dtype <bf16|int8|fp8|nvfp4|k8v4|kvarn>]
           [--spec <mtp|dflash|dflash2> --draft-tokens <n>] [--lm-head-draft]
           [--device <id>] [--no-cuda-graph] [--profile-measured]
           [-o, --output <table|json|csv>] [--output-file <path>]
