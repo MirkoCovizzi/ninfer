@@ -207,6 +207,9 @@ int main(int argc, char** argv) {
                     ops::kvarn_attention(qt, kt, vt, pt, provisional ? ct : Tensor{}, row_tensor,
                                          0.0625F, cache, provisional, envelope, workspace, ot,
                                          nullptr);
+                    if (provisional) {
+                        ops::kvarn_commit_pages(pt, ct, row_tensor, cache, nullptr);
+                    }
                 }
                 CUDA_CHECK(cudaEventRecord(stop));
                 CUDA_CHECK(cudaEventSynchronize(stop));

@@ -53,7 +53,6 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     const int block_begin   = key_begin / Bc;
     const int block_end     = min((max_query_abs / Bc) + 1, (key_end + Bc - 1) / Bc);
     if (block_begin >= block_end) { return; }
-    const std::int32_t* block_table = metadata.block_table();
 
     const int gid       = lane >> 2;
     const int lid       = lane & 3;
@@ -117,19 +116,17 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
     float l0             = 0.0F;
     float l1             = 0.0F;
     const float scale_l2 = scale * Log2E;
-    int physical_page    = block_table[block_begin];
 
     ninfer::ops::cp_commit();
-    cache.template stage<true>(k_s, kv_head, block_begin * Bc, max_query_abs, physical_page, tid);
+    cache.template stage<true>(k_s, kv_head, block_begin * Bc, max_query_abs, tid);
     ninfer::ops::cp_commit();
 
     for (int kb = block_begin; kb < block_end; ++kb) {
-        const int k0                 = kb * Bc;
-        const int next_physical_page = kb + 1 < block_end ? block_table[kb + 1] : physical_page;
+        const int k0 = kb * Bc;
         ninfer::ops::cp_wait<0>();
         __syncthreads();
 
-        cache.template stage<false>(v_s, kv_head, k0, max_query_abs, physical_page, tid);
+        cache.template stage<false>(v_s, kv_head, k0, max_query_abs, tid);
         ninfer::ops::cp_commit();
 
         float score[QKNt][4];
@@ -247,9 +244,7 @@ __launch_bounds__(kCausalPromptThreads, 1) __global__
         ninfer::ops::cp_wait<0>();
         __syncthreads();
         if (kb + 1 < block_end) {
-            physical_page = next_physical_page;
-            cache.template stage<true>(k_s, kv_head, (kb + 1) * Bc, max_query_abs, physical_page,
-                                       tid);
+            cache.template stage<true>(k_s, kv_head, (kb + 1) * Bc, max_query_abs, tid);
             ninfer::ops::cp_commit();
         }
 

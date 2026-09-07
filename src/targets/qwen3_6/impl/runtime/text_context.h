@@ -186,9 +186,6 @@ public:
 
     void set_kvarn_provisional(bool provisional) noexcept { kvarn_provisional_ = provisional; }
 
-    void commit_text_kvarn_pages(const Tensor& positions, const Tensor& accepted_columns,
-                                 const Tensor& kv_table_rows);
-
     [[nodiscard]] const Weight* proposal_head() const noexcept { return proposal_head_; }
 
     [[nodiscard]] const std::int32_t* proposal_head_ids() const noexcept {

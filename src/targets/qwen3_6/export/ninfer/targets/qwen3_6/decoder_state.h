@@ -14,6 +14,10 @@ namespace ninfer::targets::qwen3_6 {
 inline constexpr std::int32_t kKvInt8QuantGroup = 64;
 inline constexpr std::int32_t kKvFp8QuantGroup  = 256;
 
+inline constexpr std::uint32_t kv_page_tokens(KvCacheStorage storage) noexcept {
+    return storage == KvCacheStorage::KvarnK4V2Group128 ? ops::kKvarnGroup : kPagedKVPageSize;
+}
+
 struct DecoderStateSpec {
     std::uint32_t full_attention_layers     = 0;
     std::uint32_t mtp_layers                = 0;
@@ -81,7 +85,7 @@ public:
     [[nodiscard]] std::uint32_t layers() const noexcept { return layers_; }
 
     [[nodiscard]] KvCacheStorage storage() const noexcept {
-        return layer_storage_ ? layer_storage_->storage : KvCacheStorage::KvarnK4V2Group64;
+        return layer_storage_ ? layer_storage_->storage : KvCacheStorage::KvarnK4V2Group128;
     }
 
     [[nodiscard]] DeviceKVPagePool& page_pool() noexcept { return pages_; }

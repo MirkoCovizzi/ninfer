@@ -33,8 +33,8 @@ struct SinkhornWorkspace {
     float* scratch;
 };
 
-__device__ __forceinline__ SinkhornWorkspace workspace_after(float* tile) {
-    float* cursor = tile + (D + 1) * Group;
+__device__ __forceinline__ SinkhornWorkspace workspace_after(__nv_bfloat16* tile) {
+    float* cursor = reinterpret_cast<float*>(tile + (D + 1) * Group);
     SinkhornWorkspace result;
     result.log_column       = cursor;
     result.log_row          = cursor + D;
@@ -48,8 +48,8 @@ __device__ __forceinline__ SinkhornWorkspace workspace_after(float* tile) {
     return result;
 }
 
-__device__ __forceinline__ void store_k_tile(const float* tile, int record, StorePointers out,
-                                             SinkhornWorkspace w) {
+__device__ __forceinline__ void store_k_tile(const __nv_bfloat16* tile, int record,
+                                             StorePointers out, SinkhornWorkspace w) {
     variance_normalize<true>(tile, w.log_column, w.log_row, w.best_column, w.best_row,
                              w.row_deviation, w.column_deviation, w.row_inverse, w.column_inverse,
                              w.scratch);
@@ -58,8 +58,8 @@ __device__ __forceinline__ void store_k_tile(const float* tile, int record, Stor
         float minimum = CUDART_INF_F;
         float maximum = -CUDART_INF_F;
         for (int token = 0; token < Group; ++token) {
-            const float balanced =
-                tile[d + (D + 1) * token] * expf(-w.best_row[d] - w.best_column[token]);
+            const float balanced = __bfloat162float(tile[d + (D + 1) * token]) *
+                                   expf(-w.best_row[d] - w.best_column[token]);
             minimum = fminf(minimum, balanced);
             maximum = fmaxf(maximum, balanced);
         }
@@ -74,9 +74,9 @@ __device__ __forceinline__ void store_k_tile(const float* tile, int record, Stor
             std::uint8_t packed = 0;
 #pragma unroll
             for (int item = 0; item < 2; ++item) {
-                const int token = 2 * byte + item;
-                const float balanced =
-                    tile[d + (D + 1) * token] * expf(-w.best_row[d] - w.best_column[token]);
+                const int token      = 2 * byte + item;
+                const float balanced = __bfloat162float(tile[d + (D + 1) * token]) *
+                                       expf(-w.best_row[d] - w.best_column[token]);
                 const int q = max(0, min(15, __float2int_rn((balanced - minimum) / rtn_scale)));
                 packed |= static_cast<std::uint8_t>(q << (4 * item));
             }
@@ -89,8 +89,8 @@ __device__ __forceinline__ void store_k_tile(const float* tile, int record, Stor
     }
 }
 
-__device__ __forceinline__ void store_v_tile(const float* tile, int record, StorePointers out,
-                                             SinkhornWorkspace w) {
+__device__ __forceinline__ void store_v_tile(const __nv_bfloat16* tile, int record,
+                                             StorePointers out, SinkhornWorkspace w) {
     variance_normalize<false>(tile, w.log_column, w.log_row, w.best_column, w.best_row,
                               w.row_deviation, w.column_deviation, w.row_inverse, w.column_inverse,
                               w.scratch);
@@ -103,8 +103,8 @@ __device__ __forceinline__ void store_v_tile(const float* tile, int record, Stor
         float minimum = CUDART_INF_F;
         float maximum = -CUDART_INF_F;
         for (int d = 0; d < D; ++d) {
-            const float balanced =
-                tile[d + (D + 1) * tid] * expf(-w.best_row[tid] - w.best_column[d]);
+            const float balanced = __bfloat162float(tile[d + (D + 1) * tid]) *
+                                   expf(-w.best_row[tid] - w.best_column[d]);
             minimum = fminf(minimum, balanced);
             maximum = fmaxf(maximum, balanced);
         }
@@ -119,9 +119,9 @@ __device__ __forceinline__ void store_v_tile(const float* tile, int record, Stor
             std::uint8_t packed = 0;
 #pragma unroll
             for (int item = 0; item < 4; ++item) {
-                const int d = 4 * byte + item;
-                const float balanced =
-                    tile[d + (D + 1) * tid] * expf(-w.best_row[tid] - w.best_column[d]);
+                const int d          = 4 * byte + item;
+                const float balanced = __bfloat162float(tile[d + (D + 1) * tid]) *
+                                       expf(-w.best_row[tid] - w.best_column[d]);
                 const int q = max(0, min(3, __float2int_rn((balanced - minimum) / rtn_scale)));
                 packed |= static_cast<std::uint8_t>(q << (2 * item));
             }

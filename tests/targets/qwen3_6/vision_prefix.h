@@ -4,10 +4,13 @@
 
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
 namespace ninfer::test {
 
-inline void vision_prefix_reuse(Engine& engine, SpeculativeBackend backend) {
+inline std::vector<TokenId> vision_prefix_reuse(Engine& engine, SpeculativeBackend backend) {
+    std::vector<TokenId> continuation_tokens;
     for (const auto kind : {MediaKind::Image, MediaKind::Video}) {
         const std::string header = "P6\n64 64\n255\n";
         MessagePart media;
@@ -47,7 +50,38 @@ inline void vision_prefix_reuse(Engine& engine, SpeculativeBackend backend) {
             first.generated_token_ids != reused.generated_token_ids) {
             throw std::runtime_error("Vision text-suffix prefix reuse changed the result");
         }
+
+        ChatMessage assistant;
+        assistant.role              = ChatRole::Assistant;
+        assistant.reasoning_content = first.reasoning;
+        assistant.parts.push_back(
+            {.kind = MessagePartKind::Text, .text = first.content, .media = {}});
+        auto next_media = input.messages.front();
+        next_media.parts.front().media.bytes.back() ^= 0x5aU;
+        next_media.parts.back().text = "Compare the two patterns briefly.";
+        input.messages.push_back(std::move(assistant));
+        input.messages.push_back(std::move(next_media));
+        const auto appended                  = engine.generate(engine.prepare(input), options);
+        options.execution.allow_prefix_reuse = false;
+        const auto fresh                     = engine.generate(engine.prepare(input), options);
+        if (appended.reused_prompt_tokens == 0 || appended.timings.vision_seconds <= 0 ||
+            appended.generated_token_ids.size() != 8 ||
+            appended.finish_reason != FinishReason::OutputLimit ||
+            fresh.generated_token_ids.size() != 8 ||
+            fresh.finish_reason != FinishReason::OutputLimit) {
+            throw std::runtime_error(
+                std::string("New-media continuation failed: kind=") +
+                (kind == MediaKind::Image ? "image" : "video") +
+                " reused=" + std::to_string(appended.reused_prompt_tokens) +
+                " vision=" + std::to_string(appended.timings.vision_seconds) +
+                " outputs=" + std::to_string(appended.generated_token_ids.size()));
+        }
+        // Full prefill and suffix reuse differ numerically. Callers compare these same-schedule
+        // continuation tokens across Host and Device checkpoint placement instead.
+        continuation_tokens.insert(continuation_tokens.end(), appended.generated_token_ids.begin(),
+                                   appended.generated_token_ids.end());
     }
+    return continuation_tokens;
 }
 
 } // namespace ninfer::test

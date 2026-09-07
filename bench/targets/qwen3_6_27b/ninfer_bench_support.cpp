@@ -53,7 +53,7 @@ KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
-    if (text == "kvarn") { return KvCacheStorage::KvarnK4V2Group64; }
+    if (text == "kvarn") { return KvCacheStorage::KvarnK4V2Group128; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
     if (text == "k8v4") { return KvCacheStorage::Fp8KeyNvfp4Value; }
     throw std::invalid_argument("--kv-dtype must be bf16, int8, fp8, nvfp4, k8v4, or kvarn");
@@ -868,8 +868,8 @@ std::string kv_cache_name(KvCacheStorage storage) {
         return "int8-group64";
     case KvCacheStorage::Fp8E4M3Row256:
         return "fp8-e4m3-row256";
-    case KvCacheStorage::KvarnK4V2Group64:
-        return "kvarn-k4v2-group64";
+    case KvCacheStorage::KvarnK4V2Group128:
+        return "kvarn-k4v2-group128";
     case KvCacheStorage::Nvfp4Group16:
         return "nvfp4";
     case KvCacheStorage::Fp8KeyNvfp4Value:

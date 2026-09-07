@@ -60,54 +60,13 @@ performance measurements.
 
 ## KVarN Long-Context Integration
 
-The September 6 KVarN/DFlash2 integration sweep used the RTX 5090 Laptop GPU, CUDA 13.1,
-GCC 15.3, Release/sm_120a, and the converted Qwen3.8 QUASAR NVFP4 artifact with DFlash2.
-All rows below use the same current artifact, one request, KVarN, CUDA Graphs, greedy sampling,
-1,024-token prefill chunks, no prefix reuse, and 128 timed decode tokens. Each point has one
-discarded warmup and one measured repetition; these are workload-specific observations, not
-statistically established averages across conversations. The local token corpus contains 260,096
-tokens; prompt lengths are deliberately not page-aligned.
-
-| Prompt tokens | Ordinary | MTP5 full | DFlash2 K7 full | DFlash2 K15 full | DFlash2 K7 optimized |
-|---:|---:|---:|---:|---:|---:|
-| 8,190 | 43.2 | 144.1 | 128.5 | 126.1 | 134.5 |
-| 32,799 | 41.4 | 142.8 | 229.9 | 267.1 | 237.1 |
-| 131,103 | 34.9 | 109.4 | 158.5 | 124.6 | 117.4 |
-| 196,607 | 30.9 | 94.8 | 129.1 | 104.4 | 132.0 |
-| 245,743 | 28.5 | 87.1 | 124.1 | 98.1 | 119.4 |
-
-Values are decode tokens/second. "Optimized" enables `--lm-head-draft`; "full" omits it.
-K7 full is the most consistent high-context setting in this corpus. At 131,103 tokens, the
-optimized head reduces acceptance from 98.2% to 68.4%, outweighing its cheaper proposal work.
-K15 full accepts only 53.8%, 55.4%, and 60.0% at the three deepest prompts. A larger draft count
-or cheaper proposal head is therefore not an unconditional improvement.
-
-K7 full prefill throughput at 32K/128K/192K/240K is approximately
-3,614/1,741/1,296/1,088 tokens/second. The corresponding fresh-prefill times are
-9.1/75.3/151.8/225.9 seconds: prefill dominates a long fresh prompt followed by a short answer.
-The decode speedups must not be presented as equivalent whole-request speedups.
-
-Reports are retained locally as `profiles/bench/kvarn-dflash2-sync-*.json`.
-The original-path MTP5 check measured 143.23/109.08 tokens/second at 32K/128K, versus
-141.99/108.55 before synchronization. That comparison changed the compiler and the artifact
-container size, although loaded tensor counts and byte totals agree; it is not a strictly
-identical-artifact before/after experiment.
-
-Qualification passed all 108 self-contained C++ tests, 83 Python tests (three prerequisite skips),
-and 19 evaluation-tool tests. Real-artifact checks include ordinary-token agreement for MTP1..5
-and DFlash2 K1/3/7/15 through 8,192 generated tokens and at 245,743 prompt tokens plus 512 outputs;
-MTP5/DFlash2 K15 also pass unequal C2 rows and confirmed prefix reuse around 120K tokens per row.
-Separate DFlash2 cases cover C8, eager/Graph execution, full/optimized heads, BF16/INT8 controls,
-page boundaries, terminal settlement, ring wrap, and capacity exhaustion.
-
-The matched image/video suffix-reuse regression exposed a shared runtime bug: after restoring
-media, a text-only prefill card lost the saved RoPE offset. Text-only and forced-token prefill now
-receive that offset explicitly. The regression passes under MTP and DFlash2, including Device and
-Host restoration. Live OpenAI Chat/Responses and Anthropic smoke tests pass with KVarN under
-MTP5 and DFlash2 K7. This does not establish exact cold/reused token parity across arbitrary
-prefill partitions: an exploratory use of the broader Vision fixture under Qwen3.8/KVarN failed
-its cold-versus-retaining custom-stop token expectation, which remains unqualified by the matched
-suffix regression. The needle campaign was cancelled; no fresh retrieval-quality claim is made.
+`--kv-dtype kvarn` now selects K4V2-G128 with unquantized current-step attention and
+committed-group encoding. Its mathematical contract and qualification commands are in
+[Paged KV cache](maintainer/paged-kv-cache.md#kvarn-record-and-tail-semantics).
+The previous G64 throughput, acceptance, and ordinary/speculative parity measurements do not
+qualify this profile. No G128 end-to-end speedup, reasoning score, or retrieval-quality result is
+published here yet. Benchmark matched artifacts, chunk sizes, and sampling settings before
+comparing throughput; always report speculative acceptance alongside decode speed.
 
 ## Desktop Serving Results
 

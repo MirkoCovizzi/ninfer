@@ -168,113 +168,125 @@ void verify_kvarn(const char* artifact, const KvarnCases& cases) {
                                                   ? std::vector<std::uint32_t>{0, 1, 3, 7, 15}
                                                   : std::vector<std::uint32_t>{0, 3, 1, 2, 4, 5};
     for (std::uint32_t depth : depths) {
-        if (cases.depth >= 0 && depth != 0 && depth != cases.depth) { continue; }
-        auto options = engine_options(artifact, ninfer::KvCacheStorage::KvarnK4V2Group64, depth,
-                                      cases.concurrency);
-        options.speculative.backend = depth == 0 ? ninfer::SpeculativeBackend::None : cases.backend;
-        const auto prompt_capacity =
-            cases.sample < 0 ? (samples == 8 ? long_contexts.back() : 4096U)
-                             : (cases.sample >= 3 ? long_contexts[cases.sample - 3] : 4096U);
-        options.max_context = cases.output_tokens + prompt_capacity + 16;
-        options.kv_capacity =
-            ninfer::KvCapacityPolicy::explicit_capacity(cases.concurrency * options.max_context);
-        options.prefill_chunk  = cases.prefill_chunk;
-        options.use_cuda_graph = cases.graphs;
-        if (cases.full_proposal_head) {
-            options.speculative.proposal_head = ninfer::ProposalHead::Full;
-        }
-        if (cases.prefix_reuse) {
-            options.context_cache.device_state_slots        = cases.concurrency;
-            options.context_cache.max_private_continuations = cases.concurrency;
-        }
-        ninfer::Engine engine(options);
-        auto request                         = greedy_request(cases.output_tokens);
-        request.execution.allow_prefix_reuse = cases.prefix_reuse;
-        for (int sample = 0; sample < samples; ++sample) {
-            if (cases.sample >= 0 && sample != cases.sample) { continue; }
-            const auto prepare = [&](std::uint32_t row) {
-                if (sample >= 3) {
-                    const auto length = long_contexts[sample - 3] - 7 * row;
-                    if (cases.corpus.size() < length) {
-                        throw std::invalid_argument("corpus is shorter than the selected prompt");
-                    }
-                    return engine.prepare_tokens(std::vector<ninfer::TokenId>(
-                        cases.corpus.begin(), cases.corpus.begin() + length));
-                }
-                if (sample == 2) {
-                    return engine.prepare_tokens(
-                        std::vector<ninfer::TokenId>(2110 + 31 * row, 198));
-                }
-                auto input = prompt();
-                if (sample == 1) {
-                    std::string text;
-                    for (std::uint32_t index = 0; index < 190 + 11 * row; ++index) { text += "x "; }
-                    text += "\nWrite a numbered list of 200 distinct fictional identifiers. "
-                            "Do not explain the task and do not stop before the list is complete.";
-                    input.messages[0].parts[0].text = std::move(text);
-                    input.options.enable_thinking   = false;
-                } else if (row > 0) {
-                    input.messages[0].parts[0].text +=
-                        "\nNumber the comments starting from " + std::to_string(row * 10) + ".";
-                }
-                return engine.prepare(std::move(input));
-            };
-            // Establish real reusable state, not a second measured generation of the same case.
-            std::vector<ninfer::TokenId> warm_tokens;
+        if (cases.depth >= 0 && depth != cases.depth) { continue; }
+        // Huawei's committed-group flush policy is step-dependent. Compare fresh executions of
+        // the same backend, not different speculative widths with different raw-tail lifetimes.
+        for (int repeat = 0; repeat < 2; ++repeat) {
+            auto options = engine_options(artifact, ninfer::KvCacheStorage::KvarnK4V2Group128,
+                                          depth, cases.concurrency);
+            options.speculative.backend =
+                depth == 0 ? ninfer::SpeculativeBackend::None : cases.backend;
+            const auto prompt_capacity =
+                cases.sample < 0 ? (samples == 8 ? long_contexts.back() : 4096U)
+                                 : (cases.sample >= 3 ? long_contexts[cases.sample - 3] : 4096U);
+            options.max_context    = cases.output_tokens + prompt_capacity + 16;
+            options.kv_capacity    = ninfer::KvCapacityPolicy::explicit_capacity(cases.concurrency *
+                                                                                 options.max_context);
+            options.prefill_chunk  = cases.prefill_chunk;
+            options.use_cuda_graph = cases.graphs;
+            if (cases.full_proposal_head) {
+                options.speculative.proposal_head = ninfer::ProposalHead::Full;
+            }
             if (cases.prefix_reuse) {
-                auto warm_request                              = request;
-                warm_request.execution.requested_output_tokens = 1;
-                for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
-                    const auto warm = engine.generate(prepare(row), warm_request);
-                    if (warm.generated_token_ids.size() != 1) {
-                        throw std::runtime_error("KVarN prefix prewarm failed");
+                options.context_cache.device_state_slots        = cases.concurrency;
+                options.context_cache.max_private_continuations = cases.concurrency;
+            }
+            ninfer::Engine engine(options);
+            auto request                         = greedy_request(cases.output_tokens);
+            request.execution.allow_prefix_reuse = cases.prefix_reuse;
+            for (int sample = 0; sample < samples; ++sample) {
+                if (cases.sample >= 0 && sample != cases.sample) { continue; }
+                const auto prepare = [&](std::uint32_t row) {
+                    if (sample >= 3) {
+                        const auto length = long_contexts[sample - 3] - 7 * row;
+                        if (cases.corpus.size() < length) {
+                            throw std::invalid_argument(
+                                "corpus is shorter than the selected prompt");
+                        }
+                        return engine.prepare_tokens(std::vector<ninfer::TokenId>(
+                            cases.corpus.begin(), cases.corpus.begin() + length));
                     }
-                    warm_tokens.push_back(warm.generated_token_ids.front());
+                    if (sample == 2) {
+                        return engine.prepare_tokens(
+                            std::vector<ninfer::TokenId>(2110 + 31 * row, 198));
+                    }
+                    auto input = prompt();
+                    if (sample == 1) {
+                        std::string text;
+                        for (std::uint32_t index = 0; index < 190 + 11 * row; ++index) {
+                            text += "x ";
+                        }
+                        text +=
+                            "\nWrite a numbered list of 200 distinct fictional identifiers. "
+                            "Do not explain the task and do not stop before the list is complete.";
+                        input.messages[0].parts[0].text = std::move(text);
+                        input.options.enable_thinking   = false;
+                    } else if (row > 0) {
+                        input.messages[0].parts[0].text +=
+                            "\nNumber the comments starting from " + std::to_string(row * 10) + ".";
+                    }
+                    return engine.prepare(std::move(input));
+                };
+                // Establish real reusable state, not a second measured generation of the same case.
+                std::vector<ninfer::TokenId> warm_tokens;
+                if (cases.prefix_reuse) {
+                    auto warm_request                              = request;
+                    warm_request.execution.requested_output_tokens = 1;
+                    for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
+                        const auto warm = engine.generate(prepare(row), warm_request);
+                        if (warm.generated_token_ids.size() != 1) {
+                            throw std::runtime_error("KVarN prefix prewarm failed");
+                        }
+                        warm_tokens.push_back(warm.generated_token_ids.front());
+                    }
                 }
-            }
-            const auto before = engine.runtime_stats();
-            std::vector<std::uint32_t> prompt_tokens;
-            std::vector<ninfer::GenerationHandle> handles;
-            std::cout << "starting kvarn spec=" << (dflash2 ? "dflash2" : "mtp") << " k=" << depth
-                      << " sample=" << sample << " C=" << cases.concurrency
-                      << " output=" << cases.output_tokens << " prefill=" << cases.prefill_chunk
-                      << " graphs=" << cases.graphs << " prefix=" << cases.prefix_reuse
-                      << std::endl;
-            for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
-                auto prepared = prepare(row);
-                prompt_tokens.push_back(prepared.summary().prompt_tokens);
-                auto row_request = request;
-                row_request.execution.requested_output_tokens -= row;
-                handles.push_back(engine.submit(std::move(prepared), row_request));
-            }
-            for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
-                const auto result = handles[row].wait();
-                const std::string label =
-                    "kvarn k=" + std::to_string(depth) + " sample=" + std::to_string(sample) +
-                    " row=" + std::to_string(row) + " prompt=" + std::to_string(prompt_tokens[row]);
-                if (result.generated_token_ids.size() != cases.output_tokens - row) {
-                    throw std::runtime_error(label + " did not reach the requested decode length");
+                const auto before = engine.runtime_stats();
+                std::vector<std::uint32_t> prompt_tokens;
+                std::vector<ninfer::GenerationHandle> handles;
+                std::cout << "starting kvarn spec=" << (dflash2 ? "dflash2" : "mtp")
+                          << " k=" << depth << " sample=" << sample << " C=" << cases.concurrency
+                          << " output=" << cases.output_tokens << " prefill=" << cases.prefill_chunk
+                          << " graphs=" << cases.graphs << " prefix=" << cases.prefix_reuse
+                          << " repeat=" << repeat << std::endl;
+                for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
+                    auto prepared = prepare(row);
+                    prompt_tokens.push_back(prepared.summary().prompt_tokens);
+                    auto row_request = request;
+                    row_request.execution.requested_output_tokens -= row;
+                    handles.push_back(engine.submit(std::move(prepared), row_request));
                 }
-                if (depth != 0 && (result.speculative.backend != cases.backend ||
-                                   result.speculative.rounds == 0)) {
-                    throw std::runtime_error(label + " did not execute the selected backend");
+                for (std::uint32_t row = 0; row < cases.concurrency; ++row) {
+                    const auto result       = handles[row].wait();
+                    const std::string label = "kvarn k=" + std::to_string(depth) +
+                                              " sample=" + std::to_string(sample) +
+                                              " row=" + std::to_string(row) +
+                                              " prompt=" + std::to_string(prompt_tokens[row]);
+                    if (result.generated_token_ids.size() != cases.output_tokens - row) {
+                        throw std::runtime_error(label +
+                                                 " did not reach the requested decode length");
+                    }
+                    if (depth != 0 && (result.speculative.backend != cases.backend ||
+                                       result.speculative.rounds == 0)) {
+                        throw std::runtime_error(label + " did not execute the selected backend");
+                    }
+                    if (cases.prefix_reuse &&
+                        (result.reused_prompt_tokens != prompt_tokens[row] ||
+                         result.generated_token_ids.front() != warm_tokens[row])) {
+                        throw std::runtime_error(
+                            label + " did not restore the prewarmed frontier: reused=" +
+                            std::to_string(result.reused_prompt_tokens));
+                    }
+                    if (repeat == 0) { expected[sample][row] = result.generated_token_ids; }
+                    verify_result(label, result, expected[sample][row]);
+                    std::cout << label << " matched " << expected[sample][row].size()
+                              << " tokens reused=" << result.reused_prompt_tokens << std::endl;
                 }
-                if (cases.prefix_reuse &&
-                    (result.reused_prompt_tokens != prompt_tokens[row] ||
-                     result.generated_token_ids.front() != warm_tokens[row])) {
-                    throw std::runtime_error(label +
-                                             " did not restore the prewarmed frontier: reused=" +
-                                             std::to_string(result.reused_prompt_tokens));
+                const auto after = engine.runtime_stats();
+                if (cases.concurrency > 1 && after.decode_row_rounds - before.decode_row_rounds <=
+                                                 after.decode_rounds - before.decode_rounds) {
+                    throw std::runtime_error(
+                        "KVarN concurrent case did not execute a compact batch");
                 }
-                if (depth == 0) { expected[sample][row] = result.generated_token_ids; }
-                verify_result(label, result, expected[sample][row]);
-                std::cout << label << " matched " << expected[sample][row].size()
-                          << " tokens reused=" << result.reused_prompt_tokens << std::endl;
-            }
-            const auto after = engine.runtime_stats();
-            if (cases.concurrency > 1 && after.decode_row_rounds - before.decode_row_rounds <=
-                                             after.decode_rounds - before.decode_rounds) {
-                throw std::runtime_error("KVarN concurrent case did not execute a compact batch");
             }
         }
     }
@@ -296,7 +308,7 @@ int main(int argc, char** argv) {
         unsigned selected_concurrency = 0;
         for (int index = 1; index < argc; ++index) {
             const std::string_view argument(argv[index]);
-            if (argument == "--kvarn-only") {
+            if (argument == "--kvarn-repeatability") {
                 kvarn_only = true;
             } else if (argument == "--spec" && index + 1 < argc) {
                 const std::string_view backend(argv[++index]);
@@ -337,7 +349,7 @@ int main(int argc, char** argv) {
                 selected_kv = argv[++index];
                 if (selected_kv != "bf16" && selected_kv != "int8") {
                     throw std::invalid_argument(
-                        "--kv-dtype requires bf16 or int8; use --kvarn-only for KVarN");
+                        "--kv-dtype requires bf16 or int8; use --kvarn-repeatability for KVarN");
                 }
             } else if (argument == "--no-cuda-graph") {
                 cases.graphs = false;
@@ -354,7 +366,7 @@ int main(int argc, char** argv) {
                 }
             } else {
                 throw std::invalid_argument(
-                    "usage: mtp_greedy_parity_real_test [--kvarn-only] "
+                    "usage: mtp_greedy_parity_real_test [--kvarn-repeatability] "
                     "[--output-tokens 128..16384] [--sample 0..7] "
                     "[--spec mtp|dflash2] [--draft-tokens K] [--prefill-chunk 1..4096] "
                     "[--concurrency 1..8] [--full-proposal-head] "
@@ -366,7 +378,8 @@ int main(int argc, char** argv) {
             if (!kvarn_only || !selected_kv.empty() ||
                 (cases.depth >= 0 && cases.depth != 1 && cases.depth != 3 && cases.depth != 7 &&
                  cases.depth != 15)) {
-                throw std::invalid_argument("DFlash2 requires --kvarn-only and K=1,3,7,15");
+                throw std::invalid_argument(
+                    "DFlash2 requires --kvarn-repeatability and K=1,3,7,15");
             }
         } else if (cases.depth > 5) {
             throw std::invalid_argument("MTP requires K=1..5");

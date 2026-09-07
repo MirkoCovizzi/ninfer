@@ -583,7 +583,7 @@ int run_cached_attention_case(CacheFixture<Heads, Pages>& cache, int query_heads
                                 envelope, workspace, output_tensor, nullptr);
     cuda_synchronize();
 
-    std::vector<std::uint16_t> rotated_query(query.size());
+    std::vector<double> rotated_query(query.size());
     for (int column = 0; column < width; ++column) {
         for (int head = 0; head < query_heads; ++head) {
             for (int row = 0; row < kD; ++row) {
@@ -599,7 +599,7 @@ int run_cached_attention_case(CacheFixture<Heads, Pages>& cache, int query_heads
                 const std::size_t output_index =
                     static_cast<std::size_t>(row) +
                     static_cast<std::size_t>(kD) * (head + query_heads * column);
-                rotated_query[output_index] = f32_to_bf16(static_cast<float>(sum / 16.0));
+                rotated_query[output_index] = sum / 16.0;
             }
         }
     }
@@ -619,7 +619,7 @@ int run_cached_attention_case(CacheFixture<Heads, Pages>& cache, int query_heads
                     const std::size_t query_index =
                         static_cast<std::size_t>(d) +
                         static_cast<std::size_t>(kD) * (head + query_heads * column);
-                    dot += bf16_to_f32(rotated_query[query_index]) *
+                    dot += rotated_query[query_index] *
                            decode_cache_value(record_values, tail_key, marker_values, true,
                                               position, head / (query_heads / Heads), Heads, d);
                 }
@@ -638,9 +638,7 @@ int run_cached_attention_case(CacheFixture<Heads, Pages>& cache, int query_heads
                                                          head / (query_heads / Heads), Heads, d);
                 }
             }
-            for (double& value : rotated) {
-                value = bf16_to_f32(f32_to_bf16(static_cast<float>(value / denominator)));
-            }
+            for (double& value : rotated) { value /= denominator; }
             for (int row = 0; row < kD; ++row) {
                 double sum = 0.0;
                 for (int col = 0; col < kD; ++col) {
@@ -651,7 +649,7 @@ int run_cached_attention_case(CacheFixture<Heads, Pages>& cache, int query_heads
                 const std::size_t output_index =
                     static_cast<std::size_t>(row) +
                     static_cast<std::size_t>(kD) * (head + query_heads * column);
-                expected[output_index] = bf16_to_f32(f32_to_bf16(static_cast<float>(sum / 16.0)));
+                expected[output_index] = sum / 16.0;
             }
         }
     }
@@ -728,7 +726,7 @@ int run_prefill_slab_boundary_case() {
     for (int sample = 0; sample < static_cast<int>(std::size(SampleHeads)); ++sample) {
         const int head    = SampleHeads[sample];
         const int kv_head = head / (QueryHeads / Heads);
-        std::vector<std::uint16_t> rotated_query(kD);
+        std::vector<double> rotated_query(kD);
         for (int row = 0; row < kD; ++row) {
             double sum = 0.0;
             for (int col = 0; col < kD; ++col) {
@@ -737,7 +735,7 @@ int run_prefill_slab_boundary_case() {
                 sum += (negative ? -1.0 : 1.0) * query_vectors[static_cast<std::size_t>(col) +
                                                                static_cast<std::size_t>(kD) * head];
             }
-            rotated_query[row] = f32_to_bf16(static_cast<float>(sum / 16.0));
+            rotated_query[row] = sum / 16.0;
         }
 
         double maximum     = -std::numeric_limits<double>::infinity();
@@ -746,9 +744,9 @@ int run_prefill_slab_boundary_case() {
         for (int position = 0; position < Context; ++position) {
             double dot = 0.0;
             for (int d = 0; d < kD; ++d) {
-                dot += bf16_to_f32(rotated_query[d]) *
-                       decode_cache_value(record_values, tail_key, marker_values, true, position,
-                                          kv_head, Heads, d, 0, Pages);
+                dot += rotated_query[d] * decode_cache_value(record_values, tail_key, marker_values,
+                                                             true, position, kv_head, Heads, d, 0,
+                                                             Pages);
             }
             const double score           = dot * 0.0625;
             const double previous_weight = score > maximum ? std::exp(maximum - score) : 1.0;
@@ -762,11 +760,8 @@ int run_prefill_slab_boundary_case() {
                                                       false, position, kv_head, Heads, d, 0, Pages);
             }
             if (position < FirstPosition) { continue; }
-            std::vector<float> normalized(kD);
-            for (int d = 0; d < kD; ++d) {
-                normalized[d] =
-                    bf16_to_f32(f32_to_bf16(static_cast<float>(numerator[d] / denominator)));
-            }
+            std::vector<double> normalized(kD);
+            for (int d = 0; d < kD; ++d) { normalized[d] = numerator[d] / denominator; }
             const int column = position - FirstPosition;
             for (int row = 0; row < kD; ++row) {
                 double sum = 0.0;
@@ -778,7 +773,7 @@ int run_prefill_slab_boundary_case() {
                 const std::size_t index =
                     static_cast<std::size_t>(row) +
                     static_cast<std::size_t>(kD) * (sample + std::size(SampleHeads) * column);
-                expected[index] = bf16_to_f32(f32_to_bf16(static_cast<float>(sum / 16.0)));
+                expected[index] = sum / 16.0;
             }
         }
     }
@@ -876,7 +871,7 @@ int run_batched_attention_case(int query_heads, const char* label) {
                                 envelope, workspace, output_tensor, nullptr);
     cuda_synchronize();
 
-    std::vector<std::uint16_t> rotated_query(query.size());
+    std::vector<double> rotated_query(query.size());
     for (int batch = 0; batch < Batch; ++batch) {
         for (int column = 0; column < Width; ++column) {
             for (int head = 0; head < query_heads; ++head) {
@@ -894,7 +889,7 @@ int run_batched_attention_case(int query_heads, const char* label) {
                     const std::size_t index = static_cast<std::size_t>(row) +
                                               static_cast<std::size_t>(kD) *
                                                   (head + query_heads * (column + Width * batch));
-                    rotated_query[index] = f32_to_bf16(static_cast<float>(sum / 16.0));
+                    rotated_query[index] = sum / 16.0;
                 }
             }
         }
@@ -919,7 +914,7 @@ int run_batched_attention_case(int query_heads, const char* label) {
                             static_cast<std::size_t>(d) +
                             static_cast<std::size_t>(kD) *
                                 (head + query_heads * (column + Width * batch));
-                        dot += bf16_to_f32(rotated_query[query_index]) *
+                        dot += rotated_query[query_index] *
                                decode_cache_value(record_values, tail_key, marker_values, true,
                                                   position, head / (query_heads / Heads), Heads, d,
                                                   table_rows[batch],
@@ -943,9 +938,7 @@ int run_batched_attention_case(int query_heads, const char* label) {
                                 BatchCacheFixture<Heads>::kLogicalPages, &cache.host_block_tables);
                     }
                 }
-                for (double& item : rotated) {
-                    item = bf16_to_f32(f32_to_bf16(static_cast<float>(item / denominator)));
-                }
+                for (double& item : rotated) { item /= denominator; }
                 for (int row = 0; row < kD; ++row) {
                     double sum = 0.0;
                     for (int col = 0; col < kD; ++col) {
@@ -957,8 +950,7 @@ int run_batched_attention_case(int query_heads, const char* label) {
                         static_cast<std::size_t>(row) +
                         static_cast<std::size_t>(kD) *
                             (head + query_heads * (column + Width * batch));
-                    expected[output_index] =
-                        bf16_to_f32(f32_to_bf16(static_cast<float>(sum / 16.0)));
+                    expected[output_index] = sum / 16.0;
                 }
             }
         }
@@ -1007,13 +999,14 @@ int run_batched_attention_case(int query_heads, const char* label) {
 
 int run_cache_lifecycle_case() {
     CacheFixture<2> cache;
-    append_cache(cache, make_cache_values(184, 0x1001U, 2), make_cache_values(184, 0x1002U, 2), 0,
-                 false);
-    append_cache(cache, make_cache_values(16, 0x2001U, 2), make_cache_values(16, 0x2002U, 2), 184,
+    constexpr int first = 2 * kGroup - 8;
+    append_cache(cache, make_cache_values(first, 0x1001U, 2), make_cache_values(first, 0x1002U, 2),
+                 0, false);
+    append_cache(cache, make_cache_values(16, 0x2001U, 2), make_cache_values(16, 0x2002U, 2), first,
                  true);
 
     std::vector<std::int32_t> provisional_positions(16);
-    for (int index = 0; index < 16; ++index) provisional_positions[index] = 184 + index;
+    for (int index = 0; index < 16; ++index) provisional_positions[index] = first + index;
     DeviceBuffer positions = to_device(provisional_positions);
     DeviceBuffer accepted  = to_device(std::vector<std::int32_t>{8});
     DeviceBuffer rows      = to_device(std::vector<std::int32_t>{0});
@@ -1023,29 +1016,30 @@ int run_cache_lifecycle_case() {
     ops::kvarn_commit_pages(positions_tensor, accepted_tensor, rows_tensor, cache.view(), nullptr);
     cuda_synchronize();
 
-    append_cache(cache, make_cache_values(8, 0x3001U, 2), make_cache_values(8, 0x3002U, 2), 192,
-                 false);
+    append_cache(cache, make_cache_values(8, 0x3001U, 2), make_cache_values(8, 0x3002U, 2),
+                 2 * kGroup, false);
     const auto marker_values = from_device<std::int32_t>(cache.markers, ops::kKvarnTailSlots);
     int failures             = 0;
-    const std::vector<std::int32_t> expected_markers{0, 1, 3, -1};
+    const std::vector<std::int32_t> expected_markers{0, 2, -1};
     failures += verify_exact("KVarN sink/tail lifecycle", marker_values, expected_markers);
 
     const auto record_values = from_device<std::uint8_t>(cache.records, cache.records.bytes);
     const auto tail_key      = from_device<std::uint16_t>(cache.tail_k, cache.tail_k.bytes / 2);
     const auto tail_value    = from_device<std::uint16_t>(cache.tail_v, cache.tail_v.bytes / 2);
-    failures += run_cached_attention_case(cache, 16, 194, 6, "KVarN H16/KV2 width-6 attention");
+    failures +=
+        run_cached_attention_case(cache, 16, 2 * kGroup + 2, 6, "KVarN H16/KV2 width-6 attention");
 
     ops::kvarn_restore_tail(150, cache.layer_view(), nullptr);
     cuda_synchronize();
     const auto restored_markers = from_device<std::int32_t>(cache.markers, ops::kKvarnTailSlots);
     failures += verify_exact("KVarN restored tail markers", restored_markers,
-                             std::vector<std::int32_t>{0, 1, 2, -1});
+                             std::vector<std::int32_t>{0, 1, -1});
     const auto restored_key   = from_device<std::uint16_t>(cache.tail_k, cache.tail_k.bytes / 2);
     const auto restored_value = from_device<std::uint16_t>(cache.tail_v, cache.tail_v.bytes / 2);
     for (int token = 0; token < kGroup; ++token) {
         for (int d = 0; d < kD; ++d) {
-            const std::size_t index = static_cast<std::size_t>(d) +
-                                      static_cast<std::size_t>(kD) * (token + kGroup * (2 * 2));
+            const std::size_t index =
+                static_cast<std::size_t>(d) + static_cast<std::size_t>(kD) * (token + kGroup * 2);
             const std::uint16_t expected_key   = f32_to_bf16(decode_cache_value(
                 record_values, tail_key, marker_values, true, 128 + token, 0, 2, d));
             const std::uint16_t expected_value = f32_to_bf16(decode_cache_value(
@@ -1196,7 +1190,7 @@ int run_35b_attention_case() {
 
 int run_tail_staging_case(int width) {
     constexpr int Heads  = 4;
-    constexpr int Prefix = 190;
+    constexpr int Prefix = 2 * kGroup - 2;
     const int Total      = Prefix + width;
     const auto key       = make_cache_values(Total, 0xc001U, Heads);
     const auto value     = make_cache_values(Total, 0xc002U, Heads);
@@ -1229,7 +1223,7 @@ int run_tail_staging_case(int width) {
         const auto markers  = from_device<std::int32_t>(cache.markers, ops::kKvarnTailSlots);
         const auto actual_k = from_device<std::uint16_t>(cache.tail_k, cache.tail_k.bytes / 2);
         const auto actual_v = from_device<std::uint16_t>(cache.tail_v, cache.tail_v.bytes / 2);
-        for (int page = 0; page < 4; ++page) {
+        for (int page = 0; page < 3; ++page) {
             if (std::count(markers.begin(), markers.end(), page) != 1) {
                 std::cerr << "KVarN staging did not give page " << page << " one tail slot\n";
                 return 1;
@@ -1259,11 +1253,9 @@ int run_tail_staging_case(int width) {
 
 template <int Heads, int QueryHeads, int Pages = 132>
 int run_speculative_boundary_case(int width, int valid, int accepted, int first) {
-    CacheFixture<Heads, Pages> sequential;
     CacheFixture<Heads, Pages> speculative;
     const auto prefix_k = make_cache_values(first, 0xd001U, Heads);
     const auto prefix_v = make_cache_values(first, 0xd002U, Heads);
-    append_cache(sequential, prefix_k, prefix_v, 0, false);
     append_cache(speculative, prefix_k, prefix_v, 0, false);
     const auto key   = make_cache_values(width, 0xd003U, Heads);
     const auto value = make_cache_values(width, 0xd004U, Heads);
@@ -1290,20 +1282,6 @@ int run_speculative_boundary_case(int width, int valid, int accepted, int first)
                                                          static_cast<std::uint32_t>(first + width)};
     WorkspaceArena workspace(
         ops::kvarn_attention_workspace_capacity_bytes(QueryHeads, envelope, 1, 1, width));
-    std::vector<double> expected(query.size(), 0);
-    for (int column = 0; column < valid; ++column) {
-        Tensor one_q = qt.slice(2, column, 1);
-        Tensor one_k = kt.slice(2, column, 1);
-        Tensor one_v = vt.slice(2, column, 1);
-        Tensor one_p = pt.slice(0, column, 1);
-        Tensor one_o = ot.slice(2, column, 1);
-        ops::kvarn_attention(one_q, one_k, one_v, one_p, Tensor{}, rt, 0.0625F, sequential.view(),
-                             false, envelope, workspace, one_o, nullptr);
-    }
-    cuda_synchronize();
-    const auto reference = from_device_bf16(output, query.size());
-    std::copy_n(reference.begin(), static_cast<std::size_t>(valid) * QueryHeads * kD,
-                expected.begin());
     const auto body = [&](cudaStream_t stream) {
         cuda_check(cudaMemcpyAsync(q.p, original_q.p, q.bytes, cudaMemcpyDeviceToDevice, stream),
                    "restore query");
@@ -1316,12 +1294,18 @@ int run_speculative_boundary_case(int width, int valid, int accepted, int first)
     };
     body(nullptr);
     cuda_synchronize();
+    const auto first_output = from_device_bf16(output, query.size());
+    cuda_check(cudaMemcpy(q.p, original_q.p, q.bytes, cudaMemcpyDeviceToDevice),
+               "restore cached query");
+    ops::kvarn::decode_attention(qt, pt, ct, rt, 0.0625F, speculative.view(), envelope, workspace,
+                                 ot, nullptr);
+    cuda_synchronize();
+    const auto expected     = from_device_bf16(output, query.size());
     const std::string label = "KVarN speculative boundary first=" + std::to_string(first) +
                               " width=" + std::to_string(width) + " valid=" + std::to_string(valid);
-    // Supplementary exact parity protects scalar/packed partition and reduction order.
-    // Independent attention oracles remain separate.
-    int failures =
-        compare_profile(label.c_str(), from_device_bf16(output, query.size()), expected, 0.0);
+    // Supplementary parity checks append/cached reads of the same unquantized current group.
+    // The reference flush policy does not require identity to token-at-a-time compression.
+    int failures               = compare_profile(label.c_str(), first_output, expected, 0.0);
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
     cudaGraphExec_t executable = nullptr;
@@ -1369,6 +1353,216 @@ int run_speculative_boundary_case(int width, int valid, int accepted, int first)
     return failures;
 }
 
+int run_publication_settlement_case() {
+    constexpr int Heads             = 2;
+    constexpr int First             = 2 * kGroup - 2;
+    const auto key                  = make_cache_values(First + 6, 0xface01, Heads);
+    const auto value                = make_cache_values(First + 6, 0xface02, Heads);
+    const std::size_t prefix_values = static_cast<std::size_t>(First) * Heads * kD;
+    int failures                    = 0;
+    for (const int committed : {1, 4}) {
+        CacheFixture<Heads> cache;
+        append_cache(cache, {key.begin(), key.begin() + prefix_values},
+                     {value.begin(), value.begin() + prefix_values}, 0, false);
+        append_cache(cache, {key.begin() + prefix_values, key.end()},
+                     {value.begin() + prefix_values, value.end()}, First, true);
+        const int frontier = First + committed;
+        ops::kvarn_restore_tail(frontier, cache.layer_view(), nullptr);
+        cuda_synchronize();
+        const auto markers  = from_device<std::int32_t>(cache.markers, ops::kKvarnTailSlots);
+        const auto actual_k = from_device<std::uint16_t>(cache.tail_k, cache.tail_k.bytes / 2);
+        const auto actual_v = from_device<std::uint16_t>(cache.tail_v, cache.tail_v.bytes / 2);
+        const int page      = frontier / kGroup;
+        const auto marker   = std::find(markers.begin(), markers.end(), page);
+        if (marker == markers.end()) {
+            std::cerr << "KVarN publication lost the partial tail\n";
+            return 1;
+        }
+        const int slot = static_cast<int>(marker - markers.begin());
+        for (int position = page * kGroup; position < frontier; ++position) {
+            for (int head = 0; head < Heads; ++head) {
+                for (int d = 0; d < kD; ++d) {
+                    double k = 0, v = 0;
+                    for (int col = 0; col < kD; ++col) {
+                        const int sign =
+                            (__builtin_popcount(static_cast<unsigned>(d & col)) & 1) ? -1 : 1;
+                        const std::size_t source = col + kD * (head + Heads * position);
+                        k += sign * key[source];
+                        v += sign * value[source];
+                    }
+                    const std::size_t destination =
+                        d + kD * (position % kGroup + kGroup * (head + Heads * slot));
+                    if (actual_k[destination] != f32_to_bf16(static_cast<float>(k / 16.0)) ||
+                        actual_v[destination] != f32_to_bf16(static_cast<float>(v / 16.0))) {
+                        std::cerr << "KVarN publication quantized an unpublished suffix into its "
+                                     "retained prefix\n";
+                        return 1;
+                    }
+                }
+            }
+        }
+        CacheFixture<Heads> expected;
+        const std::size_t kept = static_cast<std::size_t>(frontier) * Heads * kD;
+        append_cache(expected, {key.begin(), key.begin() + kept},
+                     {value.begin(), value.begin() + kept}, 0, false);
+        failures +=
+            verify_exact("KVarN final-publication records",
+                         from_device<std::uint8_t>(cache.records, cache.records.bytes),
+                         from_device<std::uint8_t>(expected.records, expected.records.bytes));
+    }
+    return failures;
+}
+
+template <int Heads, int QueryHeads>
+int run_append_attention_oracle(int first, int width, bool final_query) {
+    CacheFixture<Heads, 8> cache;
+    if (first != 0) {
+        append_cache(cache, make_cache_values(first, 0xf001, Heads),
+                     make_cache_values(first, 0xf002, Heads), 0, false);
+    }
+    const auto records = from_device<std::uint8_t>(cache.records, cache.records.bytes);
+    const auto tk      = from_device<std::uint16_t>(cache.tail_k, cache.tail_k.bytes / 2);
+    const auto tv      = from_device<std::uint16_t>(cache.tail_v, cache.tail_v.bytes / 2);
+    const auto markers = from_device<std::int32_t>(cache.markers, ops::kKvarnTailSlots);
+    const auto key     = make_cache_values(width, 0xf003, Heads);
+    const auto value   = make_cache_values(width, 0xf004, Heads);
+    const int queries  = final_query ? 1 : width;
+    const auto query   = make_cache_values(queries * QueryHeads, 0xf005);
+    const int context  = first + width;
+    const auto rotate  = [](const std::vector<float>& x) {
+        std::vector<double> y(x.size());
+        for (std::size_t base = 0; base < x.size(); base += kD) {
+            for (int d = 0; d < kD; ++d) {
+                double sum = 0;
+                for (int col = 0; col < kD; ++col) {
+                    const int sign =
+                        (__builtin_popcount(static_cast<unsigned>(d & col)) & 1) ? -1 : 1;
+                    sum += sign * x[base + col];
+                }
+                y[base + d] = sum / 16.0;
+            }
+        }
+        return y;
+    };
+    const auto current_k = rotate(key), current_v = rotate(value), rotated_q = rotate(query);
+    std::vector<double> represented_k(static_cast<std::size_t>(context) * Heads * kD);
+    std::vector<double> represented_v(represented_k.size());
+    for (int position = 0; position < first; ++position) {
+        for (int head = 0; head < Heads; ++head) {
+            for (int d = 0; d < kD; ++d) {
+                const auto index = static_cast<std::size_t>(d) + kD * (head + Heads * position);
+                represented_k[index] =
+                    decode_cache_value(records, tk, markers, true, position, head, Heads, d);
+                represented_v[index] =
+                    decode_cache_value(records, tv, markers, false, position, head, Heads, d);
+            }
+        }
+    }
+    std::copy(current_k.begin(), current_k.end(),
+              represented_k.begin() + static_cast<std::size_t>(first) * Heads * kD);
+    std::copy(current_v.begin(), current_v.end(),
+              represented_v.begin() + static_cast<std::size_t>(first) * Heads * kD);
+    std::vector<int> selected{0};
+    if (!final_query) { selected = {0, 1, width / 2, width - 1}; }
+    std::vector<double> expected;
+    for (const int column : selected) {
+        const int visible = final_query ? context : first + column + 1;
+        for (int head = 0; head < QueryHeads; ++head) {
+            const int kvhead = head / (QueryHeads / Heads);
+            std::vector<double> score(visible);
+            for (int p = 0; p < visible; ++p) {
+                for (int d = 0; d < kD; ++d) {
+                    score[p] += rotated_q[d + kD * (head + QueryHeads * column)] *
+                                represented_k[d + kD * (kvhead + Heads * p)] / 16.0;
+                }
+            }
+            const double maximum = *std::max_element(score.begin(), score.end());
+            double denominator   = 0;
+            std::vector<double> numerator(kD, 0);
+            for (int p = 0; p < visible; ++p) {
+                const double probability = std::exp(score[p] - maximum);
+                denominator += probability;
+                for (int d = 0; d < kD; ++d) {
+                    numerator[d] += probability * represented_v[d + kD * (kvhead + Heads * p)];
+                }
+            }
+            for (int d = 0; d < kD; ++d) {
+                double sum = 0;
+                for (int col = 0; col < kD; ++col) {
+                    const int sign =
+                        (__builtin_popcount(static_cast<unsigned>(d & col)) & 1) ? -1 : 1;
+                    sum += sign * numerator[col];
+                }
+                expected.push_back(sum / (16.0 * denominator));
+            }
+        }
+    }
+    auto q = to_device_bf16(query), k = to_device_bf16(key), v = to_device_bf16(value);
+    auto oq = to_device_bf16(query), ok = to_device_bf16(key), ov = to_device_bf16(value);
+    auto old_records = to_device(records), old_tk = to_device(tk), old_tv = to_device(tv),
+         old_markers = to_device(markers);
+    std::vector<std::int32_t> positions(width);
+    std::iota(positions.begin(), positions.end(), first);
+    auto dp = to_device(positions), rows = to_device(std::vector<std::int32_t>{0});
+    DeviceBuffer output(query.size() * 2);
+    Tensor qt(q.p, DType::BF16, {kD, QueryHeads, queries, 1});
+    Tensor kt(k.p, DType::BF16, {kD, Heads, width, 1}), vt(v.p, DType::BF16, {kD, Heads, width, 1});
+    Tensor pt(dp.p, DType::I32, {width, 1}), rt(rows.p, DType::I32, {1});
+    Tensor ot(output.p, DType::BF16, {kD, QueryHeads, queries, 1});
+    const ops::CausalAttentionExecutionEnvelope envelope{1, static_cast<std::uint32_t>(context)};
+    WorkspaceArena workspace(
+        ops::kvarn_attention_workspace_capacity_bytes(QueryHeads, envelope, 1, queries, queries));
+    const auto body = [&](cudaStream_t stream) {
+        for (auto pair : {std::pair{&q, &oq},
+                          {&k, &ok},
+                          {&v, &ov},
+                          {&cache.records, &old_records},
+                          {&cache.tail_k, &old_tk},
+                          {&cache.tail_v, &old_tv},
+                          {&cache.markers, &old_markers}}) {
+            cuda_check(cudaMemcpyAsync(pair.first->p, pair.second->p, pair.first->bytes,
+                                       cudaMemcpyDeviceToDevice, stream),
+                       "restore append oracle inputs");
+        }
+        ops::kvarn_attention(qt, kt, vt, pt, Tensor{}, rt, 0.0625F, cache.view(), false, envelope,
+                             workspace, ot, stream);
+    };
+    const auto compare = [&] {
+        auto full = from_device_bf16(output, query.size());
+        if (!std::all_of(full.begin(), full.end(), [](double x) { return std::isfinite(x); })) {
+            std::cerr << "KVarN append produced non-finite output\n";
+            return 1;
+        }
+        std::vector<double> actual;
+        for (int column : selected) {
+            actual.insert(actual.end(),
+                          full.begin() + static_cast<std::size_t>(column) * QueryHeads * kD,
+                          full.begin() + static_cast<std::size_t>(column + 1) * QueryHeads * kD);
+        }
+        return compare_profile("KVarN unquantized-current-chunk oracle", actual, expected, 8.0e-3);
+    };
+    body(nullptr);
+    cuda_synchronize();
+    int failures               = compare();
+    cudaStream_t stream        = nullptr;
+    cudaGraph_t graph          = nullptr;
+    cudaGraphExec_t executable = nullptr;
+    cuda_check(cudaStreamCreate(&stream), "append oracle stream");
+    cuda_check(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal),
+               "append oracle capture");
+    body(stream);
+    cuda_check(cudaStreamEndCapture(stream, &graph), "append oracle end capture");
+    cuda_check(cudaGraphInstantiate(&executable, graph, nullptr, nullptr, 0),
+               "append oracle instantiate");
+    cuda_check(cudaGraphLaunch(executable, stream), "append oracle replay");
+    cuda_synchronize(stream);
+    failures += compare();
+    cudaGraphExecDestroy(executable);
+    cudaGraphDestroy(graph);
+    cudaStreamDestroy(stream);
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -1378,6 +1572,11 @@ int main() {
     }
     int failures = run_codec_case();
     failures += run_hadamard_case();
+    failures += run_publication_settlement_case();
+    failures += run_append_attention_oracle<4, 24>(0, 384, false);
+    failures += run_append_attention_oracle<4, 24>(254, 256, false);
+    failures += run_append_attention_oracle<4, 24>(254, 256, true);
+    failures += run_append_attention_oracle<2, 16>(254, 256, false);
     failures += run_cache_lifecycle_case();
     failures += run_27b_attention_case();
     failures += run_27b_grouped_decode_case<2>();

@@ -60,7 +60,7 @@ int main(int argc, char** argv) {
         options.enable_vision                    = argc > 6 && std::stoi(argv[6]) != 0;
         const std::string_view codec             = argc > 5 ? argv[5] : "bf16";
         if (codec == "kvarn") {
-            options.kv_cache = ninfer::KvCacheStorage::KvarnK4V2Group64;
+            options.kv_cache = ninfer::KvCacheStorage::KvarnK4V2Group128;
         } else if (codec == "int8") {
             options.kv_cache = ninfer::KvCacheStorage::Int8Group64;
         } else if (codec == "bf16") {
@@ -92,11 +92,12 @@ int main(int argc, char** argv) {
         // Keep prompt splits fixed while changing checkpoint placement. Drafter suffix writes
         // must follow a Device fork to its new slot, just as they follow a Host snapshot in place.
         std::vector<ninfer::TokenId> host_capture_tokens;
+        std::vector<ninfer::TokenId> host_vision_tokens;
         for (const unsigned device_slots : {0U, 1U}) {
             auto capture_options            = options;
             capture_options.max_concurrency = 1;
             capture_options.kv_capacity     = ninfer::KvCapacityPolicy::explicit_capacity(2304);
-            capture_options.enable_vision   = false;
+            capture_options.enable_vision   = options.enable_vision;
             capture_options.context_cache.device_state_slots  = device_slots;
             capture_options.context_cache.host_state_slots    = 8;
             capture_options.context_cache.max_shared_prefixes = 0;
@@ -134,9 +135,21 @@ int main(int argc, char** argv) {
                 require(result.generated_token_ids == host_capture_tokens,
                         "DFlash2 sampled output changed across Host/Device checkpoint placement");
             }
+            if (options.enable_vision) {
+                const auto vision_tokens = ninfer::test::vision_prefix_reuse(
+                    capture_engine, ninfer::SpeculativeBackend::DFlash2);
+                if (device_slots == 0) {
+                    host_vision_tokens = vision_tokens;
+                } else {
+                    require(
+                        vision_tokens == host_vision_tokens,
+                        "DFlash2 new-media output changed across Host/Device checkpoint placement");
+                }
+            }
         }
         ninfer::Engine engine(options);
         ninfer::test::speculative_page_boundary(engine);
+        if (codec == "kvarn") { ninfer::test::speculative_page_boundary(engine, 254); }
         const auto first = engine.generate(engine.prepare_tokens(prompt), request(24));
         valid(first, 24);
         require(first.generated_token_ids == reference,
@@ -222,6 +235,10 @@ int main(int argc, char** argv) {
             ninfer::test::vision_prefix_reuse(engine, ninfer::SpeculativeBackend::DFlash2);
         }
         const auto stats = engine.runtime_stats();
+        if (options.context_cache.device_state_slots == 0) {
+            require(stats.state_d2h_count > 0 && stats.state_h2d_count > 0,
+                    "DFlash2 did not restore Host checkpoint state");
+        }
         require(stats.device_backend_kv_occupied_pages == 0 && stats.backend_kv_d2h_bytes == 0 &&
                     stats.backend_kv_h2d_bytes == 0,
                 "DFlash2 allocated or transferred a full backend KV pool");

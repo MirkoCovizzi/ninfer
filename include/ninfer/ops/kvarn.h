@@ -8,23 +8,23 @@
 
 namespace ninfer::ops {
 
-// Official kvarn_k4v2_g64 specialized to NInfer's only attention geometry.
+// Huawei's released kvarn_k4v2_g128 profile at D256.
 inline constexpr std::int32_t kKvarnHeadDim    = 256;
-inline constexpr std::int32_t kKvarnGroup      = 64;
+inline constexpr std::int32_t kKvarnGroup      = 128;
 inline constexpr std::int32_t kKvarnIterations = 8;
-inline constexpr std::int32_t kKvarnSinkPages  = 2;
-inline constexpr std::int32_t kKvarnTailSlots  = 4;
+inline constexpr std::int32_t kKvarnSinkPages  = 1;
+inline constexpr std::int32_t kKvarnTailSlots  = 3;
 
 inline constexpr std::int32_t kKvarnKPackedOffset       = 0;
-inline constexpr std::int32_t kKvarnKScaleOffset        = 8192;
-inline constexpr std::int32_t kKvarnKZeroOffset         = 8704;
-inline constexpr std::int32_t kKvarnKTokenScaleOffset   = 9216;
-inline constexpr std::int32_t kKvarnVPackedOffset       = 9344;
-inline constexpr std::int32_t kKvarnVChannelScaleOffset = 13440;
-inline constexpr std::int32_t kKvarnVTokenScaleOffset   = 13952;
-inline constexpr std::int32_t kKvarnVTokenZeroOffset    = 14080;
-inline constexpr std::int32_t kKvarnRecordPayloadBytes  = 14208;
-inline constexpr std::int32_t kKvarnRecordBytes         = 14336;
+inline constexpr std::int32_t kKvarnKScaleOffset        = 16384;
+inline constexpr std::int32_t kKvarnKZeroOffset         = 16896;
+inline constexpr std::int32_t kKvarnKTokenScaleOffset   = 17408;
+inline constexpr std::int32_t kKvarnVPackedOffset       = 17664;
+inline constexpr std::int32_t kKvarnVChannelScaleOffset = 25856;
+inline constexpr std::int32_t kKvarnVTokenScaleOffset   = 26368;
+inline constexpr std::int32_t kKvarnVTokenZeroOffset    = 26624;
+inline constexpr std::int32_t kKvarnRecordPayloadBytes  = 26880;
+inline constexpr std::int32_t kKvarnRecordBytes         = 26880;
 static_assert(kKvarnRecordBytes >= kKvarnRecordPayloadBytes && kKvarnRecordBytes % 256 == 0);
 
 struct KvarnTileStorage {

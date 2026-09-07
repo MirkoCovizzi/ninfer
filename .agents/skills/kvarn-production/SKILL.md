@@ -7,11 +7,11 @@ description: Use for KVarN implementation, optimization, qualification, or revie
 
 ## Fixed Contract
 
-- Target Huawei KVarN K4V2-G64 only: D256, group 64, K4/V2, 8 Sinkhorn passes.
+- Target Huawei KVarN K4V2-G128 only: D256, group 128, K4/V2, 8 Sinkhorn passes.
 - Treat Huawei commit `7586257f1c632e63187bfacbbe21ccb51540f7b3` as the codec/layout reference.
 - Keep KVarN implementation under `src/ops/kvarn/`. Do not add KVarN branches, policies, or loaders
   to BF16/INT8 kernels. Share only identity-free primitives and reducers.
-- Preserve official record bits, NInfer page translation, sink/tail lifecycle, and public Engine
+- Preserve the official packed fields, 128-token page ownership, sink/tail lifecycle, and public Engine
   semantics. Do not add generic bit-width machinery.
 - Work directly without subagents. Make one focused change at a time.
 
@@ -68,12 +68,12 @@ description: Use for KVarN implementation, optimization, qualification, or revie
 9. Rebuild `ninfer-serve` only after operator qualification. Smoke the real artifact, CUDA Graph,
    MTP width 6, prefix restore, and concurrent rows affected by the change.
    For cache-transition changes, build `ninfer_qwen3_6_27b_mtp_greedy_parity_real_test` and run it
-   with `--kvarn-only` and explicit `NINFER_MTP_GREEDY_PARITY_WEIGHTS`. This checks exact generated
-   token parity for MTP0 through MTP5 over 8,192 generated tokens by default, one run per case/row/depth.
+    with `--kvarn-repeatability` and explicit `NINFER_MTP_GREEDY_PARITY_WEIGHTS`. This checks exact
+    same-backend repeatability for MTP0 through MTP5 over 8,192 generated tokens by default.
    Use the targeted matrix in `docs/maintainer/paged-kv-cache.md` for mixed concurrent rows,
    confirmed prefix restoration, eager/full-head execution, and long resident contexts. Do not
-   substitute a 128-token smoke for the long-decode gate. Packed groups must preserve each query's
-   scalar split partition as well as its page representation.
+    substitute a 128-token smoke for the long-decode gate. Current-step K/V remain unquantized;
+    only committed groups are encoded. Different speculative widths need not match ordinary decode.
 10. Run quality qualification after performance stabilizes: matched 192K INT8/KVarN, 64 needles,
     fixed seeds `0..9`, greedy generation, thinking/speculation/prefix reuse disabled. Report each
     `correct/64` and the arithmetic mean across ten seeds (640 retrievals per format).
@@ -83,7 +83,7 @@ description: Use for KVarN implementation, optimization, qualification, or revie
 - Exact codecs use exact bit checks; floating-point attention uses the independent represented-cache
   oracle and an explicit tolerance. Pairwise implementation parity is supplementary only.
 - Distinguish the paper's experimental profile and variance-spread pseudocode from the released
-  K4V2-G64 standard-deviation-spread implementation. The alignment and intentional precision/lifecycle
+  K4V2-G128 standard-deviation-spread implementation. The alignment and implementation precision
   differences are recorded in `docs/maintainer/paged-kv-cache.md`; do not claim paper quality results
   or byte-identical cross-engine encoding from mathematical/packed-layout agreement.
 - Never claim bandwidth-, compute-, or occupancy-bound behavior without profiler evidence.

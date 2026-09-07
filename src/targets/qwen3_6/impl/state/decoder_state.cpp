@@ -9,9 +9,9 @@
 namespace ninfer::targets::qwen3_6 {
 namespace {
 
-std::uint32_t page_count(std::uint32_t capacity) {
+std::uint32_t page_count(std::uint32_t capacity, std::uint32_t page_tokens) {
     if (capacity == 0) { throw std::invalid_argument("Paged KV capacity must be positive"); }
-    return 1U + (capacity - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
+    return 1U + (capacity - 1U) / page_tokens;
 }
 
 PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std::uint32_t capacity,
@@ -22,25 +22,26 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
         kv_heads <= 0 || head_dim <= 0 || table_rows <= 0) {
         throw std::invalid_argument("Paged KV cache geometry is invalid");
     }
-    const bool kvarn = storage == KvCacheStorage::KvarnK4V2Group64;
+    const bool kvarn = storage == KvCacheStorage::KvarnK4V2Group128;
     if (kvarn && head_dim != ops::kKvarnHeadDim) {
         throw std::invalid_argument("KVarN requires D256 heads");
     }
     const std::optional<PagedKVStorageLayout> layer_storage =
         kvarn ? std::nullopt : std::optional{paged_kv_storage_layout(storage, head_dim)};
 
-    const std::uint32_t logical_pages = page_count(capacity);
+    const std::uint32_t logical_pages = page_count(capacity, kv_page_tokens(storage));
     if (physical_page_groups < logical_pages) {
         throw std::invalid_argument("Paged KV physical pages are below logical capacity");
     }
 
     KVPageGeometry geometry;
+    geometry.page_tokens = kv_page_tokens(storage);
     geometry.planes.reserve(static_cast<std::size_t>(layers) *
                             (kvarn ? 1ULL : layer_storage->planes_per_layer()));
     for (std::uint32_t layer = 0; layer < layers; ++layer) {
         if (kvarn) {
             geometry.planes.push_back(
-                {DType::U8, ops::kKvarnRecordBytes / kPagedKVPageSize, kv_heads, 256});
+                {DType::U8, ops::kKvarnRecordBytes / ops::kKvarnGroup, kv_heads, 256});
             continue;
         }
         geometry.planes.push_back(
@@ -71,10 +72,10 @@ PagedKVCacheLayout plan_cache(LayoutBuilder& builder, std::uint32_t layers, std:
     if (kvarn) {
         const std::int32_t row_heads = table_rows * kv_heads * ops::kKvarnTailSlots;
         layout.kvarn_tail_k          = builder.add_tensor(
-            DType::BF16, {head_dim, kPagedKVPageSize, row_heads, static_cast<std::int32_t>(layers)},
+            DType::BF16, {head_dim, ops::kKvarnGroup, row_heads, static_cast<std::int32_t>(layers)},
             256, "KVarN rotated K sink/tail");
         layout.kvarn_tail_v = builder.add_tensor(
-            DType::BF16, {head_dim, kPagedKVPageSize, row_heads, static_cast<std::int32_t>(layers)},
+            DType::BF16, {head_dim, ops::kKvarnGroup, row_heads, static_cast<std::int32_t>(layers)},
             256, "KVarN rotated V sink/tail");
         layout.kvarn_tail_logical_pages = builder.add_tensor(
             DType::I32, {ops::kKvarnTailSlots, table_rows, static_cast<std::int32_t>(layers)}, 256,
@@ -186,10 +187,10 @@ ops::KvarnPagedLayerView PagedKVCache::kvarn_layer_view(std::uint32_t layer, Ten
         .records = pages_.plane(layer),
         .tail_k  = kvarn_tail_k_.slice(3, static_cast<std::int32_t>(layer), 1)
                       .slice(2, begin, row_heads)
-                      .view({ops::kKvarnHeadDim, kPagedKVPageSize, row_heads}),
+                      .view({ops::kKvarnHeadDim, ops::kKvarnGroup, row_heads}),
         .tail_v = kvarn_tail_v_.slice(3, static_cast<std::int32_t>(layer), 1)
                       .slice(2, begin, row_heads)
-                      .view({ops::kKvarnHeadDim, kPagedKVPageSize, row_heads}),
+                      .view({ops::kKvarnHeadDim, ops::kKvarnGroup, row_heads}),
         .tail_logical_pages =
             kvarn_tail_logical_pages_.slice(2, static_cast<std::int32_t>(layer), 1)
                 .slice(1, table_row, 1)
@@ -208,9 +209,9 @@ ops::KvarnPagedBatchLayerView PagedKVCache::kvarn_batch_layer_view(std::uint32_t
     return {
         .records = pages_.plane(layer),
         .tail_k  = kvarn_tail_k_.slice(3, static_cast<std::int32_t>(layer), 1)
-                      .view({ops::kKvarnHeadDim, kPagedKVPageSize, row_heads, rows}),
+                      .view({ops::kKvarnHeadDim, ops::kKvarnGroup, row_heads, rows}),
         .tail_v = kvarn_tail_v_.slice(3, static_cast<std::int32_t>(layer), 1)
-                      .view({ops::kKvarnHeadDim, kPagedKVPageSize, row_heads, rows}),
+                      .view({ops::kKvarnHeadDim, ops::kKvarnGroup, row_heads, rows}),
         .tail_logical_pages =
             kvarn_tail_logical_pages_.slice(2, static_cast<std::int32_t>(layer), 1)
                 .view({ops::kKvarnTailSlots, rows}),

@@ -20,7 +20,7 @@ cmake --build build --parallel --target ninfer_bench
 ## Product benchmark
 
 For KVarN, use at least 128 decode tokens and include non-page-aligned prompt lengths so the
-measurement includes periodic 64-token page encoding and speculative page-boundary handling.
+measurement includes periodic 128-token group encoding and speculative group-boundary handling.
 Record acceptance alongside throughput; a short, all-accepted run is not representative of every
 MTP workload.
 
@@ -34,7 +34,8 @@ former as an amortized per-token latency.
 Use `--phase cached|append|provisional|prefill` and `--width 1..16` to isolate a decode/append
 case for kernel profiling; omit `--width` for the 1,024-token prefill case. `--batch 1..8` uses
 independent cache rows with equal context lengths; prefill is measured only at batch one.
-Provisional cases supply explicit valid-column counts, as the Engine does. Multi-row cases use
+Provisional cases supply explicit valid-column counts and include all-valid acceptance/commit,
+as a complete accepted Engine round does. Multi-row cases use
 the runtime's conservative lower execution-envelope bound by default. `--tight-envelope` instead
 uses the exact common frontier to measure launch overprovisioning on this homogeneous fixture;
 it is not a production optimization or evidence that arbitrary mixed-row graphs can use that bound.
@@ -46,160 +47,14 @@ H24/KV4 calls use eight-column chunks above 1,024 visible keys, not an Engine MT
 ./build/bench/ninfer_kvarn_attention_bench --context 32774 --phase provisional --width 4 --batch 2
 ```
 
-**KVarN Parity Qualification**
+**KVarN Qualification**
 
-The regression matrix and paper/reference comparison are maintained in
-[`paged-kv-cache.md`](../docs/maintainer/paged-kv-cache.md#greedy-regression).
-The parity fixes retain packed decode and the K4V2-G64 codec. A matched public Engine check on
-Qwen3.8-27B NVFP4, RTX 5090 Laptop GPU (82 SMs), CUDA 13.1/driver 13.2 used MTP5 with the optimized
-proposal head, CUDA Graphs, 1,024-token prefill chunks, one warmup and one measured repetition:
-
-| Prompt + generated tokens | Before partition fix, decode tok/s | Qualified implementation, decode tok/s |
-|---|---:|---:|
-| 32,799 + 128 | 161.43 | 161.55 |
-| 131,103 + 128 | 92.41 | 90.68 |
-
-Acceptance remained 1.0 and 0.85 respectively. These are single-run measurements, not a claim of
-statistical equivalence or zero cost: the final 128K point is about 1.9% slower. Final prefill
-rates were 3,676 and 1,756 tok/s, versus 3,703 and 1,781 before the partition fix. This comparison
-does not establish multi-request throughput or the paper's quality results.
-
-Wide-batch parity additionally requires the W8 vocabulary projection to retain the same eight-way
-K reduction through 48 columns. At `N=248320,K=5120`, single cold-cache Linear samples at T=40/48
-changed from 2.228/2.582 ms to 2.423/2.848 ms. Staging the 48-column activation tile in two halves
-reduced its initial corrected latency from 3.708 ms to 2.848 ms. Nsight Compute confirmed static
-shared memory fell from 57,856 to 33,280 bytes and the occupancy limit rose from one to two CTAs
-per SM. This residual operator cost affects wide batches, not single-request vocabulary dispatch.
-
-The KVarN-local probability-tile swizzle subsequently removed two-way matrix-load bank conflicts
-without changing arithmetic or cache semantics. On the same GPU/toolchain, C=1 masked width-four
-append-and-attend medians at visible contexts 32,774 / 131,078 / 196,614 changed from
-142.112 / 534.528 / 784.384 us to 138.048 / 520.192 / 759.808 us (about 3% lower).
-The C=2 32,774-context case changed from 282.624 to 276.480 us with the production-conservative
-execution envelope unchanged. Page-closing and width-five/six 192K samples showed substantial
-timing variability; they do not establish a uniform gain across all cases.
-
-A matched, unprofiled public Engine MTP3 run with the optimized proposal head, graphs, 1,024-token
-prefill chunks, one warmup, and one measured repetition changed decode throughput from
-133.24 to 133.40 tok/s at 32,799 + 128 and from 86.49 to 87.25 tok/s at 131,103 + 128.
-Acceptance remained 1.0 / 0.85047. These small single-run changes are not statistical guarantees.
-Nsight Compute 2025.4.1 at its base-clock setting attributed the operator improvement to excess
-shared-memory wavefronts falling from 14,283,232 to 1,304,992; probability matrix-load conflicts
-were eliminated, while occupancy remained one 512-thread CTA per SM. Qualification passed the
-independent KVarN Op suite, all-depth 8,192-token greedy parity, and C=2 MTP3 prefix restoration.
-
-Split-local page-boundary grouping further limits duplicated history traversal to the KV splits
-that actually intersect a closing page. On the same GPU/toolchain, C=1 page-closing Op calls ending
-at 196,608 keys changed as follows (medians in us):
-
-| Logical width | Global boundary grouping | Split-local boundary grouping |
-|---|---:|---:|
-| 4 | 1542.144 | 968.704 |
-| 8 | 3384.288 | 2672.640 |
-| 16 | 5074.944 | 4364.288 |
-
-The non-closing width-16 case ending at 196,624 keys was effectively unchanged, 4213.760 versus
-4204.512 us. Width-8/16 samples were variable; these are workload-specific measurements, not a
-uniform speedup claim. Nsight Compute confirms that the closing width-four producer performs
-near ordinary-call work: 315.1 million executed instructions versus 311.6 million in the preceding
-non-closing swizzled profile, with the same 984-CTA launch capacity and one resident CTA per SM.
-
-The matched C=1 MTP3 Engine workload above changed from 133.40 to 133.67 tok/s at 32K and
-87.25 to 87.79 tok/s at 128K, with unchanged acceptance. This is a substantial reduction in periodic
-closure cost, but only a small single-run average throughput gain. Independent Op checks include
-exact sequential/provisional, graph replay, and replacement encoding at logical widths 8 and 16;
-all-depth 8,192-token Engine parity and C=2 MTP5 prefix restoration also passed. The separate
-dynamic-MTP branch uses its own chunk policy and graph topology: these results do not qualify
-K=15 Engine behavior or throughput on that branch.
-
-The scalar decode schedule uses two QK producers and six V/PV workers, with compact collective
-statistics for the real query-head rows. On the same GPU/toolchain, width-one provisional Op
-medians at 8,198 / 32,774 / 131,078 / 196,614 keys changed from
-44.480 / 103.584 / 393.216 / 576.512 us to 43.392 / 96.640 / 372.736 / 546.816 us.
-The four-column 192K check changed from 772.096 to 759.808 us; width-six samples remained variable
-and do not establish a gain. The selected implementation retains the original V metadata layout.
-
-A matched C=1 MTP0 public Engine run on Qwen3.8-27B NVFP4 used graphs, 1,024-token prefill chunks,
-one warmup, and one measured repetition. Decode throughput changed from 40.93 to 40.98 tok/s at
-32,799 + 128, and from 30.41 to 30.72 tok/s at 194,431 + 128. Prefill was unchanged within 0.1%.
-These are single-run measurements, not a statistical guarantee or a replacement for the separate
-needle-test throughput measurement. Nsight Compute 2025.4.1 confirms 49,992 bytes of static shared
-memory, 128 registers/thread, two resident 256-thread CTAs per SM, and no spills for scalar H24/KV4.
-Independent Op checks, all-depth 8,192-token greedy parity, and C=2 MTP3 prefix restoration passed.
-
-**Eight-Column Packed Decode**
-
-The eight-column experiment retained four two-query groups in one 512-thread CTA, sharing staged
-K/V without doubling the thread count. It applies to H24/KV4 widths five through eight above the
-1,024-key packed threshold; wider calls use eight-column chunks. Narrow/scalar dispatch is retained.
-On the same RTX 5090 Laptop GPU and CUDA 13.1/driver 13.2, masked provisional Op medians were:
-
-| Visible keys | Width | Previous six-column chunks, us | Eight-column chunks with four-column CTAs, us | Eight-column CTAs, us |
-|---|---:|---:|---:|---:|
-| 32,784 | 8 | 379.904 | 262.144 | 218.336 |
-| 32,784 | 16 | 620.192 | 504.640 | 426.080 |
-| 196,624 | 8 | 2511.872 | 1499.136 | 1234.944 |
-| 196,624 | 16 | 4195.328 | 3376.128 | 2762.752 |
-| 196,608, page closing | 8 | 2669.568 | 1843.200 | 1687.520 |
-| 196,608, page closing | 16 | 4349.952 | 3534.784 | 3048.416 |
-
-Chunking alone avoids redundant four-column groups as well as launches; the middle column isolates
-that effect from wider in-CTA reuse. Width-six calls do not change chunk decomposition: their
-32K / 128K / 192K medians changed from 255.552 / 1011.712 / 1528.800 us to
-213.184 / 822.144 / 1286.144 us. The 8K sweep also improved. Long-context samples remain variable;
-these are one benchmark invocation per case, each with three warmups and 30 timed Op samples.
-
-For width eight at 196,624 keys, Nsight Compute 2025.4.1 reports 615.4 million executed instructions
-for the chunk-only control versus 407.1 million for the wider CTA. Both use 103 registers/thread,
-one resident CTA per SM, and no spills. Reported static plus dynamic shared memory increases from
-69,376 to 88,576 bytes. Base-clock profiled kernel duration changes from 3.490 to 3.141 ms; those
-durations are not normal-clock Op timings.
-
-A matched public Engine MTP5 run used Qwen3.8-27B NVFP4, the **full proposal head**, graphs,
-1,024-token prefill chunks, one warmup, and one measured repetition. Decode changed from
-138.57 to 139.97 tok/s at 32,799 + 128 and from 96.23 to 102.79 tok/s at 131,103 + 128
-(+1.0% / +6.8%). Acceptance stayed 1.0 at both points; prefill changed by less than 0.1%.
-This is not a statistical guarantee or a comparison with the earlier optimized-proposal-head runs.
-
-Qualification passed the independent KVarN and softmax suites, random width-8/16 represented-cache
-oracles, exact scalar/packed boundary and replacement checks, and graph replay. The wider analytical
-fixture uses a BF16 numerical tolerance; its rounding error was reproduced with the four-column
-control, without changing the exact parity checks. Real Engine MTP5 matched MTP0 through 8,192
-tokens; C=2 MTP5 prefix restoration matched 1,536 / 1,535 tokens, crossing the packed threshold.
-This does not qualify K=15 Engine behavior, the separate dynamic-MTP worktree, or needle-test recall.
-
-**Inactive Packed Groups**
-
-Skipping QK/softmax and PV for fully inactive two-query groups avoids computing padded columns in
-four- and eight-column CTAs. Shared K/V staging, CTA barriers, neutral outputs, and active-query
-arithmetic remain unchanged. Against the eight-column implementation above, on the same GPU and
-toolchain, masked width-six provisional Op medians changed as follows:
-
-| Visible keys | Before, us | After, us |
-|---|---:|---:|
-| 8,240 | 78.848 | 68.800 |
-| 32,784 | 213.312 | 181.696 |
-| 131,088 | 825.312 | 712.704 |
-| 196,624 | 1240.032 | 1051.648 |
-| 196,608, page closing | 1658.880 | 1252.352 |
-
-Width-five cases also improved. At 196,624 keys, width two changed from 753.664 to 625.664 us;
-scalar and full-width 4/8/16 controls showed no material change. C=2 width six at 32,784 keys with
-the conservative envelope changed from 426.496 to 368.992 us. These use the same three-warmup,
-30-sample Op procedure; long-context timing variability remains visible in min/p95 measurements.
-
-A matched width-six Nsight Compute comparison at 196,624 keys reports executed instructions
-falling from 402.2 to 369.6 million and registers/thread from 103 to 94. Both retain the same
-512-thread launch, 88,576 bytes of reported static plus dynamic shared memory, one resident CTA
-per SM, and no spills. Base-clock profiled kernel duration changes from 3.118 to 2.589 ms.
-
-The matched public Engine MTP5 workload above, again using the full proposal head and one measured
-repetition, changed from 139.66 to 141.99 tok/s at 32,799 + 128 and from 102.69 to 108.55 tok/s
-at 131,103 + 128 (+1.7% / +5.7%). Acceptance remained 1.0; prefill changed by less than 0.2%.
-These single-run gains do not establish statistical significance or performance at other MTP depths.
-The existing independent KVarN/softmax suites and exact boundary/masking/graph checks passed.
-All MTP depths 1 through 5 matched MTP0 through 8,192 generated tokens; C=2 MTP5 prefix restoration
-matched 1,536 / 1,535 tokens. No needle rerun or dynamic-MTP Engine qualification was performed.
+The K4V2-G128 mathematical contract and execution checks are maintained in
+[`paged-kv-cache.md`](../docs/maintainer/paged-kv-cache.md#execution-regression).
+The native implementation retains scalar/four/eight-column decode and stages G128 records in
+64-token slices. Current-step values remain unquantized through attention; group encoding occurs
+after commitment. Performance results for the previous G64/early-encoding path do not qualify
+this implementation. Measure the current preset and report acceptance with throughput.
 
 The product benchmark slices exact token counts from `bench/fixtures/bench_corpus.ids`, calls
 `Engine::prepare_tokens()`, then calls `Engine::generate()` once for each repetition. It does not

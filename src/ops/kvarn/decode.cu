@@ -19,7 +19,7 @@ template <typename Geometry, bool Masked>
 void launch_prefill(const Tensor& query, const Tensor& positions, const Tensor& valid_columns,
                     const Tensor& table_rows, float scale, KvarnPagedBatchLayerView cache,
                     CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                    Tensor& output, cudaStream_t stream) {
+                    Tensor& output, cudaStream_t stream, CurrentKV current) {
     using Metadata = PagedKVBatchMetadata<Masked>;
     const Metadata metadata{
         .tables        = static_cast<const std::int32_t*>(cache.block_tables.data),
@@ -60,7 +60,7 @@ void launch_prefill(const Tensor& query, const Tensor& positions, const Tensor& 
         detail::materialize_prefill_slab_kernel<Metadata><<<materialize_grid, D, 0, stream>>>(
             input, metadata, static_cast<const std::int32_t*>(positions.data), width, slab_begin,
             slab_capacity, static_cast<__nv_bfloat16*>(materialized_k.data),
-            static_cast<__nv_bfloat16*>(materialized_v.data));
+            static_cast<__nv_bfloat16*>(materialized_v.data), current);
         const detail::MaterializedPrefillInput materialized{
             static_cast<const __nv_bfloat16*>(materialized_k.data),
             static_cast<const __nv_bfloat16*>(materialized_v.data),
@@ -87,7 +87,7 @@ void launch_partial(const Tensor& query, const Tensor& positions, const Tensor& 
                     const Tensor& table_rows, float scale, KvarnPagedBatchLayerView cache,
                     CausalAttentionExecutionEnvelope envelope, int column_begin, int width,
                     int splits, Tensor& partial_acc, Tensor& partial_m, Tensor& partial_l,
-                    Tensor& output, cudaStream_t stream) {
+                    Tensor& output, cudaStream_t stream, CurrentKV current) {
     const dim3 grid(Geometry::KVHeads, splits,
                     query.ne[3] * div_up(width + 2 * (ColumnsPerBlock - 1), ColumnsPerBlock));
     constexpr int query_groups    = ColumnsPerBlock >= 4 ? ColumnsPerBlock / 2 : ColumnsPerBlock;
@@ -109,7 +109,7 @@ void launch_partial(const Tensor& query, const Tensor& positions, const Tensor& 
             static_cast<const std::int32_t*>(table_rows.data), cache.block_tables.ne[0], width,
             query.ne[2], column_begin, static_cast<std::int32_t>(envelope.max_visible_keys),
             cache.num_kv_heads, scale, static_cast<__nv_bfloat16*>(partial_acc.data),
-            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data));
+            static_cast<float*>(partial_m.data), static_cast<float*>(partial_l.data), current);
     CUDA_CHECK(cudaGetLastError());
 
     const dim3 reduce_grid(Geometry::QHeads, 1, width * query.ne[3]);
@@ -128,27 +128,27 @@ void launch_partial(const Tensor& query, const Tensor& positions, const Tensor& 
 void decode_attention(const Tensor& query, const Tensor& positions, const Tensor& valid_columns,
                       const Tensor& table_rows, float scale, KvarnPagedBatchLayerView cache,
                       CausalAttentionExecutionEnvelope envelope, WorkspaceArena& workspace,
-                      Tensor& output, cudaStream_t stream) {
+                      Tensor& output, cudaStream_t stream, CurrentKV current) {
     if (query.ne[3] == 1 && query.ne[2] >= kCausalPromptBr) {
         const bool masked = valid_columns.data != nullptr;
         if (query.ne[1] == CausalD256H24Kv4::QHeads) {
             if (masked) {
                 launch_prefill<CausalD256H24Kv4, true>(query, positions, valid_columns, table_rows,
                                                        scale, cache, envelope, workspace, output,
-                                                       stream);
+                                                       stream, current);
             } else {
                 launch_prefill<CausalD256H24Kv4, false>(query, positions, valid_columns, table_rows,
                                                         scale, cache, envelope, workspace, output,
-                                                        stream);
+                                                        stream, current);
             }
         } else if (masked) {
             launch_prefill<CausalD256H16Kv2, true>(query, positions, valid_columns, table_rows,
                                                    scale, cache, envelope, workspace, output,
-                                                   stream);
+                                                   stream, current);
         } else {
             launch_prefill<CausalD256H16Kv2, false>(query, positions, valid_columns, table_rows,
                                                     scale, cache, envelope, workspace, output,
-                                                    stream);
+                                                    stream, current);
         }
         return;
     }
@@ -186,16 +186,16 @@ void decode_attention(const Tensor& query, const Tensor& positions, const Tensor
                 if (pair_columns && width > 4) {
                     launch_partial<Geometry, MultiBatch, Masked, 8>(
                         query, positions, valid_columns, table_rows, scale, cache, envelope, begin,
-                        width, splits, acc, m, l, output, stream);
+                        width, splits, acc, m, l, output, stream, current);
                 } else if (pair_columns) {
                     // Narrow widths mask unused columns.
                     launch_partial<Geometry, MultiBatch, Masked, 4>(
                         query, positions, valid_columns, table_rows, scale, cache, envelope, begin,
-                        width, splits, acc, m, l, output, stream);
+                        width, splits, acc, m, l, output, stream, current);
                 } else {
                     launch_partial<Geometry, MultiBatch, Masked, 1>(
                         query, positions, valid_columns, table_rows, scale, cache, envelope, begin,
-                        width, splits, acc, m, l, output, stream);
+                        width, splits, acc, m, l, output, stream, current);
                 }
             };
             if (multi) {

@@ -6,6 +6,7 @@
 
 #include "ops/kvarn/config.cuh"
 
+#include <cuda_bf16.h>
 #include <math_constants.h>
 
 namespace ninfer::ops::kvarn {
@@ -58,18 +59,18 @@ struct Orientation {
     static constexpr int Cols  = Key ? Group : D;
     static constexpr int Pitch = D + 1;
 
-    __device__ static float get(const float* tile, int row, int col) {
+    __device__ static float get(const __nv_bfloat16* tile, int row, int col) {
         if constexpr (Key) {
-            return tile[row + Pitch * col];
+            return __bfloat162float(tile[row + Pitch * col]);
         } else {
-            return tile[col + Pitch * row];
+            return __bfloat162float(tile[col + Pitch * row]);
         }
     }
 };
 
 template <bool Key>
-__device__ float row_std(const float* tile, const float* row_inverse, const float* column_inverse,
-                         int row) {
+__device__ float row_std(const __nv_bfloat16* tile, const float* row_inverse,
+                         const float* column_inverse, int row) {
     using O           = Orientation<Key>;
     float sum         = 0.0F;
     float sum_squared = 0.0F;
@@ -83,7 +84,7 @@ __device__ float row_std(const float* tile, const float* row_inverse, const floa
 }
 
 template <bool Key>
-__device__ float column_std(const float* tile, const float* row_inverse,
+__device__ float column_std(const __nv_bfloat16* tile, const float* row_inverse,
                             const float* column_inverse, int col) {
     using O           = Orientation<Key>;
     float sum         = 0.0F;
@@ -98,7 +99,7 @@ __device__ float column_std(const float* tile, const float* row_inverse,
 }
 
 template <bool Key>
-__device__ float measure_imbalance(const float* tile, const float* row_inverse,
+__device__ float measure_imbalance(const __nv_bfloat16* tile, const float* row_inverse,
                                    const float* column_inverse, float* row_deviation,
                                    float* column_deviation, float* scratch) {
     using O       = Orientation<Key>;
@@ -117,7 +118,7 @@ __device__ float measure_imbalance(const float* tile, const float* row_inverse,
 }
 
 template <bool Key>
-__device__ void variance_normalize(const float* tile, float* log_column, float* log_row,
+__device__ void variance_normalize(const __nv_bfloat16* tile, float* log_column, float* log_row,
                                    float* best_column, float* best_row, float* row_deviation,
                                    float* column_deviation, float* row_inverse,
                                    float* column_inverse, float* scratch) {

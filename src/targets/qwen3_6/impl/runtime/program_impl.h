@@ -53,10 +53,6 @@ std::int32_t checked_i32(std::uint32_t value, const char* label) {
     return static_cast<std::int32_t>(value);
 }
 
-std::uint32_t kv_pages_for_frontier(std::uint32_t frontier) noexcept {
-    return frontier == 0 ? 0U : 1U + (frontier - 1U) / static_cast<std::uint32_t>(kPagedKVPageSize);
-}
-
 std::size_t context_resource_index(runtime::ContextResourceClass resource) {
     switch (resource) {
     case runtime::ContextResourceClass::State:
@@ -1032,7 +1028,7 @@ std::vector<float> ProgramImplCore::causal_score(PreparedPromptData&& prompt,
     const auto token_count                     = static_cast<std::uint32_t>(token_count_size);
     const std::uint32_t predictor_count        = token_count - 1U;
     const std::uint32_t scored_predictor_begin = first_target - 1U;
-    const std::uint32_t entitlement            = kv_pages_for_frontier(predictor_count);
+    const std::uint32_t entitlement = text_kv_addresses->pages_for_tokens(predictor_count);
     if (entitlement == 0) { throw std::logic_error("causal score has no KV entitlement"); }
 
     std::optional<StateImageHandle> state;
@@ -1353,10 +1349,9 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
     if (kv == nullptr) { return protection; }
 
     protection.text       = kv->text;
-    protection.text_pages = kv_pages_for_frontier(admission.reuse_base);
+    protection.text_pages = text_kv_addresses->pages_for_tokens(admission.reuse_base);
     if (protection.consumed_private_source) {
-        protection.text_transfer_pages =
-            admission.reuse_base / static_cast<std::uint32_t>(kPagedKVPageSize);
+        protection.text_transfer_pages = admission.reuse_base / text_kv_addresses->page_tokens();
     }
     if (!text_kv_addresses->valid(kv->text) ||
         protection.text_pages > text_kv_addresses->mapped_pages(kv->text)) {
@@ -1368,10 +1363,11 @@ ProgramImplCore::materialization_source_protection(const ResourceCandidateState&
     }
     const std::uint32_t backend_frontier =
         backend_frontier_at(speculative_backend, admission.reuse_base);
-    protection.backend_pages = kv_pages_for_frontier(backend_frontier);
+    protection.backend_pages =
+        backend_kv_addresses ? backend_kv_addresses->pages_for_tokens(backend_frontier) : 0U;
     if (protection.consumed_private_source) {
         protection.backend_transfer_pages =
-            backend_frontier / static_cast<std::uint32_t>(kPagedKVPageSize);
+            backend_kv_addresses ? backend_frontier / backend_kv_addresses->page_tokens() : 0U;
     }
     if (protection.backend_pages != 0) {
         if (!kv->backend || !backend_kv_addresses || !backend_kv_addresses->valid(*kv->backend) ||
@@ -2501,7 +2497,7 @@ std::optional<qwen3_6::detail::PressureDecision> ProgramImplCore::inspect_checkp
             KVAddressSpaceHandle address, std::uint32_t retained_frontier,
             std::uint32_t& removed_pages) -> bool {
         if (!addresses.can_truncate_inactive_prefix(address, retained_frontier)) { return false; }
-        const std::uint32_t retained_pages = kv_pages_for_frontier(retained_frontier);
+        const std::uint32_t retained_pages = addresses.pages_for_tokens(retained_frontier);
         const std::uint32_t mapped         = addresses.mapped_pages(address);
         const std::size_t stride =
             plan_host_kv_page_layout(pages.physical_pool().geometry()).page_stride;
@@ -3815,11 +3811,10 @@ bool ProgramImplCore::compose_pressure_candidate(
         if (!projected_fork || planned_fork == *projected_fork) { return true; }
         if (!details.has_source ||
             details.source_mode != runtime::PrivateSourceMode::ConsumeToActive || !planned_fork ||
-            *projected_fork || frontier == 0 ||
-            frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0) {
+            *projected_fork || frontier == 0 || frontier % addresses.page_tokens() == 0) {
             return false;
         }
-        const std::uint32_t required = kv_pages_for_frontier(frontier);
+        const std::uint32_t required = addresses.pages_for_tokens(frontier);
         if (required == 0 || required > addresses.mapped_pages(address)) { return false; }
         const LogicalKVPageHandle tail = addresses.logical_page(address, required - 1U);
         const bool device_resident     = pages.device_resident(tail);
@@ -4683,13 +4678,12 @@ void ProgramImplCore::prepare_consumed_source(MaterializationTransaction& transa
             }
             continue;
         }
-        const std::uint32_t target_pages = kv_pages_for_frontier(target.frontier);
+        const std::uint32_t target_pages = target.addresses->pages_for_tokens(target.frontier);
         if (target_pages != 0) {
             const LogicalKVPageHandle tail =
                 target.addresses->logical_page(target.address, target_pages - 1U);
             const std::uint32_t columns =
-                target.frontier -
-                (target_pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
+                target.frontier - (target_pages - 1U) * target.addresses->page_tokens();
             target.releases_stale_host_tail = columns != target.pages->committed_columns(tail) &&
                                               target.pages->host_resident(tail);
             if (target.releases_stale_host_tail) {
@@ -4934,7 +4928,7 @@ void ProgramImplCore::prepare_materialization(MaterializationTransaction& transa
             std::vector<MaterializationTransaction::KVRestorePage>& restores,
             std::vector<DeviceKVPageHandle>& destinations) {
             const std::uint32_t mapped = activation_frontier
-                                             ? kv_pages_for_frontier(*activation_frontier)
+                                             ? addresses.pages_for_tokens(*activation_frontier)
                                              : addresses.mapped_pages(address);
             if (mapped > addresses.mapped_pages(address)) {
                 throw std::logic_error("KV activation frontier exceeds address membership");
@@ -5067,8 +5061,7 @@ void ProgramImplCore::prepare_prefix_forks(MaterializationTransaction& transacti
             *text_kv_addresses, *text_kv_pages, *transaction.text_prefix_fork,
             details.text_retained_tail_release, transaction.text_retained_tail,
             transaction.text_retained_tail_backup);
-        if (*transaction.text_activation_frontier % static_cast<std::uint32_t>(kPagedKVPageSize) !=
-            0) {
+        if (*transaction.text_activation_frontier % text_kv_addresses->page_tokens() != 0) {
             start_context_transfer_timer(runtime::ContextResourceClass::MainKV);
             text_kv_pages->physical_pool().copy_page(
                 text_kv_addresses->prefix_fork_tail_source(*transaction.text_prefix_fork),
@@ -5099,9 +5092,7 @@ void ProgramImplCore::prepare_prefix_forks(MaterializationTransaction& transacti
             *backend_kv_addresses, *backend_kv_pages, *transaction.backend_prefix_fork,
             details.backend_retained_tail_release, transaction.backend_retained_tail,
             transaction.backend_retained_tail_backup);
-        if (*transaction.backend_activation_frontier %
-                static_cast<std::uint32_t>(kPagedKVPageSize) !=
-            0) {
+        if (*transaction.backend_activation_frontier % backend_kv_addresses->page_tokens() != 0) {
             start_context_transfer_timer(runtime::ContextResourceClass::BackendKV);
             backend_kv_pages->physical_pool().copy_page(
                 backend_kv_addresses->prefix_fork_tail_source(*transaction.backend_prefix_fork),
@@ -6940,7 +6931,7 @@ bool ProgramImplCore::can_retain_rewrite_checkpoint(const PreparedPromptData& pr
 std::uint32_t ProgramImplCore::device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                       KVAddressSpaceHandle address,
                                                       std::uint32_t frontier) const {
-    const std::uint32_t required = kv_pages_for_frontier(frontier);
+    const std::uint32_t required = addresses.pages_for_tokens(frontier);
     if (required > addresses.mapped_pages(address)) {
         throw std::logic_error("checkpoint KV requirement exceeds address membership");
     }
@@ -6956,7 +6947,7 @@ std::uint32_t ProgramImplCore::device_kv_prefix_pages(const KVAddressSpaceStore&
 std::uint32_t ProgramImplCore::shared_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                       KVAddressSpaceHandle address,
                                                       std::uint32_t frontier) const {
-    const std::uint32_t required = kv_pages_for_frontier(frontier);
+    const std::uint32_t required = addresses.pages_for_tokens(frontier);
     if (required > addresses.mapped_pages(address)) {
         throw std::logic_error("checkpoint KV requirement exceeds address membership");
     }
@@ -6965,9 +6956,7 @@ std::uint32_t ProgramImplCore::shared_kv_prefix_pages(const KVAddressSpaceStore&
     std::uint32_t shared = 0;
     for (std::uint32_t page = 0; page < required; ++page) {
         if (pages.address_references(addresses.logical_page(address, page)) <= 1) { continue; }
-        if (page + 1U == required && frontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0) {
-            continue;
-        }
+        if (page + 1U == required && frontier % addresses.page_tokens() != 0) { continue; }
         ++shared;
     }
     return shared;
@@ -6976,7 +6965,7 @@ std::uint32_t ProgramImplCore::shared_kv_prefix_pages(const KVAddressSpaceStore&
 std::uint32_t ProgramImplCore::shared_device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                              KVAddressSpaceHandle address,
                                                              std::uint32_t frontier) const {
-    const std::uint32_t required = kv_pages_for_frontier(frontier);
+    const std::uint32_t required = addresses.pages_for_tokens(frontier);
     if (required > addresses.mapped_pages(address)) {
         throw std::logic_error("checkpoint KV requirement exceeds address membership");
     }
@@ -6993,10 +6982,8 @@ std::uint32_t ProgramImplCore::shared_device_kv_prefix_pages(const KVAddressSpac
 bool ProgramImplCore::partial_tail_cow_required(const KVAddressSpaceStore& addresses,
                                                 KVAddressSpaceHandle address,
                                                 std::uint32_t frontier) const {
-    if (frontier == 0 || frontier % static_cast<std::uint32_t>(kPagedKVPageSize) == 0) {
-        return false;
-    }
-    const std::uint32_t required = kv_pages_for_frontier(frontier);
+    if (frontier == 0 || frontier % addresses.page_tokens() == 0) { return false; }
+    const std::uint32_t required = addresses.pages_for_tokens(frontier);
     if (required > addresses.mapped_pages(address)) {
         throw std::logic_error("checkpoint KV requirement exceeds address membership");
     }
@@ -7010,7 +6997,7 @@ std::uint32_t
 ProgramImplCore::missing_shared_device_kv_prefix_pages(const KVAddressSpaceStore& addresses,
                                                        KVAddressSpaceHandle address,
                                                        std::uint32_t frontier) const {
-    const std::uint32_t required = kv_pages_for_frontier(frontier);
+    const std::uint32_t required = addresses.pages_for_tokens(frontier);
     if (required > addresses.mapped_pages(address)) {
         throw std::logic_error("checkpoint KV requirement exceeds address membership");
     }
@@ -7031,21 +7018,20 @@ std::size_t ProgramImplCore::host_kv_prefix_bytes(const KVAddressSpaceStore& add
     try {
         const LogicalKVPageStore& pages =
             (&addresses == text_kv_addresses.get()) ? *text_kv_pages : *backend_kv_pages;
-        const std::uint32_t required_pages = kv_pages_for_frontier(frontier);
+        const std::uint32_t required_pages = addresses.pages_for_tokens(frontier);
         if (required_pages > addresses.mapped_pages(address)) { return 0; }
         std::size_t bytes = 0;
         for (std::uint32_t page = 0; page < required_pages; ++page) {
             const LogicalKVPageHandle logical = addresses.logical_page(address, page);
             if (pages.address_references(logical) > 1) { continue; }
             if (!pages.host_resident(logical)) { continue; }
-            if (page + 1U == required_pages &&
-                frontier % static_cast<std::uint32_t>(kPagedKVPageSize) != 0 &&
+            if (page + 1U == required_pages && frontier % addresses.page_tokens() != 0 &&
                 partial_tail_cow_required(addresses, address, frontier)) {
                 continue;
             }
-            const std::uint32_t begin = page * static_cast<std::uint32_t>(kPagedKVPageSize);
+            const std::uint32_t begin = page * addresses.page_tokens();
             const std::uint32_t selected_columns =
-                std::min(static_cast<std::uint32_t>(kPagedKVPageSize), frontier - begin);
+                std::min(addresses.page_tokens(), frontier - begin);
             if (selected_columns != pages.committed_columns(logical)) {
                 // A destructive private rewrite changes this tail page's content epoch, so its
                 // old Host replica cannot remain part of the active entitlement.
@@ -7233,8 +7219,10 @@ ProgramImplCore::checkpoint_summary(const SequenceState& sequence,
             {
                 .main_frontier    = checkpoint.frontier,
                 .backend_frontier = backend_frontier,
-                .main_pages       = kv_pages_for_frontier(checkpoint.frontier),
-                .backend_pages    = kv_pages_for_frontier(backend_frontier),
+                .main_pages       = text_kv_addresses->pages_for_tokens(checkpoint.frontier),
+                .backend_pages    = backend_kv_addresses
+                                        ? backend_kv_addresses->pages_for_tokens(backend_frontier)
+                                        : 0U,
             },
         .rebuild_work = validated_rebuild_work(rebuild_work, checkpoint.frontier),
     };
@@ -7329,8 +7317,11 @@ ProgramImplCore::shared_prefix_summary(const SharedPrefixState& shared) const {
                     {
                         .main_frontier    = shared.frontier,
                         .backend_frontier = shared.backend_frontier,
-                        .main_pages       = kv_pages_for_frontier(shared.frontier),
-                        .backend_pages    = kv_pages_for_frontier(shared.backend_frontier),
+                        .main_pages       = text_kv_addresses->pages_for_tokens(shared.frontier),
+                        .backend_pages =
+                            backend_kv_addresses
+                                ? backend_kv_addresses->pages_for_tokens(shared.backend_frontier)
+                                : 0U,
                     },
                 .rebuild_work = validated_rebuild_work(shared.rebuild_work, shared.frontier),
             },
@@ -9636,17 +9627,16 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                                                          std::optional<std::uint32_t> frontier) {
                 if (!frontier ||
                     (addresses.committed_frontier(address) == *frontier &&
-                     addresses.mapped_pages(address) == kv_pages_for_frontier(*frontier))) {
+                     addresses.mapped_pages(address) == addresses.pages_for_tokens(*frontier))) {
                     return;
                 }
                 bool releases_tail               = false;
-                const std::uint32_t target_pages = kv_pages_for_frontier(*frontier);
+                const std::uint32_t target_pages = addresses.pages_for_tokens(*frontier);
                 if (target_pages != 0) {
                     const LogicalKVPageHandle tail =
                         addresses.logical_page(address, target_pages - 1U);
                     const std::uint32_t columns =
-                        *frontier -
-                        (target_pages - 1U) * static_cast<std::uint32_t>(kPagedKVPageSize);
+                        *frontier - (target_pages - 1U) * addresses.page_tokens();
                     if (columns != pages.committed_columns(tail) && pages.host_resident(tail)) {
                         if (host_kv_extents == nullptr ||
                             stale_tail_count == stale_tail_replicas.size()) {
@@ -9687,7 +9677,7 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 (text_kv_addresses->committed_frontier(sequence.kv->text) !=
                      *transaction.text_activation_frontier ||
                  text_kv_addresses->mapped_pages(sequence.kv->text) !=
-                     kv_pages_for_frontier(*transaction.text_activation_frontier))) {
+                     text_kv_addresses->pages_for_tokens(*transaction.text_activation_frontier))) {
                 text_kv_addresses->destructive_truncate_inactive(
                     sequence.kv->text, *transaction.text_activation_frontier);
             }
@@ -9696,7 +9686,8 @@ void ProgramImplCore::start_sequence(std::uint32_t lane, SequenceState& sequence
                 (backend_kv_addresses->committed_frontier(*sequence.kv->backend) !=
                      *transaction.backend_activation_frontier ||
                  backend_kv_addresses->mapped_pages(*sequence.kv->backend) !=
-                     kv_pages_for_frontier(*transaction.backend_activation_frontier))) {
+                     backend_kv_addresses->pages_for_tokens(
+                         *transaction.backend_activation_frontier))) {
                 backend_kv_addresses->destructive_truncate_inactive(
                     *sequence.kv->backend, *transaction.backend_activation_frontier);
             }
@@ -10848,7 +10839,7 @@ void ProgramImplCore::restore_sequence_kvarn_tail(SequenceState& sequence,
     if (!sequence.kv) { return; }
     const auto restore = [&](qwen3_6::PagedKVCache& cache, KVAddressSpaceStore& addresses,
                              KVAddressSpaceHandle address, std::uint32_t frontier) {
-        if (cache.storage() != KvCacheStorage::KvarnK4V2Group64) return;
+        if (cache.storage() != KvCacheStorage::KvarnK4V2Group128) return;
         if (!addresses.active(address)) {
             throw std::logic_error("KVarN tail restore requires an active KV address space");
         }
@@ -10868,7 +10859,7 @@ void ProgramImplCore::restore_sequence_kvarn_tail(SequenceState& sequence,
 
 void ProgramImplCore::capture_sequence_kvarn_tail(const SequenceState& sequence,
                                                   StateImageHandle image) {
-    if (!sequence.kv || decoder->text_kv.storage() != KvCacheStorage::KvarnK4V2Group64) { return; }
+    if (!sequence.kv || decoder->text_kv.storage() != KvCacheStorage::KvarnK4V2Group128) { return; }
     if (!state_images->has_kvarn()) {
         throw std::logic_error("KVarN continuation StateImage storage is unavailable");
     }
@@ -10908,7 +10899,7 @@ void ProgramImplCore::capture_sequence_kvarn_tail(const SequenceState& sequence,
 }
 
 void ProgramImplCore::activate_sequence_kvarn_tail(const SequenceState& sequence) {
-    if (!sequence.kv || decoder->text_kv.storage() != KvCacheStorage::KvarnK4V2Group64) { return; }
+    if (!sequence.kv || decoder->text_kv.storage() != KvCacheStorage::KvarnK4V2Group128) { return; }
     if (!state_images->has_kvarn()) {
         throw std::logic_error("KVarN continuation StateImage storage is unavailable");
     }

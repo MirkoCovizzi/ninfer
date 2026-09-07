@@ -1,9 +1,8 @@
 #include "ninfer/ops/kvarn_attention.h"
 
 // Native CUDA execution of the fixed Huawei KVarN profile. Record decode and online-softmax follow
-// commit 7586257f1c632e63187bfacbbe21ccb51540f7b3 triton_kvarn_decode.py; permanent FP16 sinks and
-// provisional tail retention follow kvarn_attn.py. Query-position-based record visibility preserves
-// NInfer's ordinary decoding semantics across speculative page closures.
+// commit 7586257f1c632e63187bfacbbe21ccb51540f7b3 triton_kvarn_decode.py. Current-step values
+// remain unquantized through attention; only committed non-sink groups enter packed history.
 
 #include "core/device.h"
 #include "ops/kvarn/config.cuh"
@@ -25,7 +24,7 @@ namespace {
 constexpr int kThreads            = 256;
 constexpr int kFusedStageMaxWidth = 6;
 constexpr std::size_t kStoreSharedBytes =
-    ((kvarn::D + 1) * kvarn::Group + 8 * kvarn::D + 16) * sizeof(float);
+    (kvarn::D + 1) * kvarn::Group * sizeof(__nv_bfloat16) + (8 * kvarn::D + 16) * sizeof(float);
 
 struct ViewPointers {
     std::uint8_t* records;
@@ -80,8 +79,8 @@ ViewPointers pointers(KvarnPagedBatchLayerView view) {
 
 __device__ int tail_slot(int logical_page, int first_page, int last_page) {
     if (logical_page < kKvarnSinkPages) return logical_page;
-    if (logical_page == first_page) return 2;
-    if (logical_page == last_page) return 3;
+    if (logical_page == first_page) return kKvarnSinkPages;
+    if (logical_page == last_page) return kKvarnSinkPages + 1;
     return -1;
 }
 
@@ -105,7 +104,7 @@ __device__ int claim_tail_slot(const ViewPointers& cache, int row, int page, int
     const int previous = atomicCAS(markers + preferred, -1, page);
     if (previous == -1 || previous == page) { return preferred; }
     if (page < kKvarnSinkPages) { return -1; }
-    const int alternate = preferred == 2 ? 3 : 2;
+    const int alternate = preferred == kKvarnSinkPages ? kKvarnSinkPages + 1 : kKvarnSinkPages;
     const int other     = atomicCAS(markers + alternate, -1, page);
     return other == -1 || other == page ? alternate : -1;
 }
@@ -132,8 +131,8 @@ __global__ void stage_kernel(const __nv_bfloat16* key, const __nv_bfloat16* valu
     const bool full_direct       = intersection_begin == page_begin &&
                              intersection_end == page_begin + kvarn::Group &&
                              page >= kKvarnSinkPages && !provisional;
-    if (full_direct) return;
     const int row = table_rows[b];
+    if (full_direct && mapped_tail_slot(cache, row, page) < 0) return;
     __shared__ int slot;
     if (threadIdx.x == 0) { slot = claim_tail_slot(cache, row, page, first_page, last_page); }
     __syncthreads();
@@ -206,8 +205,9 @@ __device__ kvarn::StorePointers record_pointers(std::uint8_t* record) {
 __global__ void encode_kernel(const __nv_bfloat16* key, const __nv_bfloat16* value,
                               const std::int32_t* positions, const std::int32_t* valid_columns,
                               const std::int32_t* table_rows, ViewPointers cache, int width,
-                              int batch, int touched_pages, bool masked) {
+                              int batch, int touched_pages, bool masked, int settled_frontier) {
     extern __shared__ float shared[];
+    auto* tile          = reinterpret_cast<__nv_bfloat16*>(shared);
     const int encoded   = static_cast<int>(blockIdx.x);
     const bool key_path = (encoded & 1) == 0;
     int task            = encoded >> 1;
@@ -216,20 +216,22 @@ __global__ void encode_kernel(const __nv_bfloat16* key, const __nv_bfloat16* val
     const int page_index = task % touched_pages;
     const int b          = task / touched_pages;
     if (b >= batch) return;
-    const int count = masked ? valid_columns[b] : width;
-    if (count <= 0) return;
-    const int start      = positions[b * width];
-    const int end        = start + count;
+    const bool settling = positions == nullptr;
+    const int count     = settling ? 0 : (masked ? valid_columns[b] : width);
+    if (!settling && count <= 0) return;
+    const int start      = settling ? 0 : positions[b * width];
+    const int end        = settling ? settled_frontier : start + count;
     const int first_page = start / kvarn::Group;
     const int last_page  = (end - 1) / kvarn::Group;
-    const int page       = first_page + page_index;
+    const int page =
+        settling ? cache.markers[kKvarnSinkPages + page_index] : first_page + page_index;
     if (page > last_page || page < kKvarnSinkPages) return;
     const int page_begin         = page * kvarn::Group;
     const int intersection_begin = max(start, page_begin);
     const int intersection_end   = min(end, page_begin + kvarn::Group);
     if (intersection_end != page_begin + kvarn::Group) return;
-    const bool full_direct = intersection_begin == page_begin;
-    const int row          = table_rows[b];
+    const bool full_direct = intersection_begin == page_begin && key != nullptr;
+    const int row          = settling ? 0 : table_rows[b];
     const int slot         = mapped_tail_slot(cache, row, page);
     if (!full_direct && (slot < 0 || cache.markers[slot + kKvarnTailSlots * row] != page)) return;
     const int physical = cache.block_tables[page + cache.logical_pages * row];
@@ -246,23 +248,22 @@ __global__ void encode_kernel(const __nv_bfloat16* key, const __nv_bfloat16* val
             const std::int64_t input =
                 static_cast<std::int64_t>(d) +
                 static_cast<std::int64_t>(kvarn::D) * (head + cache.heads * (column + width * b));
-            shared[d + (kvarn::D + 1) * token] = __bfloat162float(source[input]);
+            tile[d + (kvarn::D + 1) * token] = source[input];
         } else {
             const std::int64_t tail =
                 static_cast<std::int64_t>(d) +
                 static_cast<std::int64_t>(kvarn::D) *
                     (token + kvarn::Group * (head + cache.heads * (slot + kKvarnTailSlots * row)));
-            shared[d + (kvarn::D + 1) * token] =
-                __bfloat162float(key_path ? cache.tail_k[tail] : cache.tail_v[tail]);
+            tile[d + (kvarn::D + 1) * token] = key_path ? cache.tail_k[tail] : cache.tail_v[tail];
         }
     }
     __syncthreads();
-    const kvarn::SinkhornWorkspace workspace = kvarn::workspace_after(shared);
+    const kvarn::SinkhornWorkspace workspace = kvarn::workspace_after(tile);
     kvarn::StorePointers output              = record_pointers(cache.records + record_index);
     if (key_path) {
-        kvarn::store_k_tile(shared, 0, output, workspace);
+        kvarn::store_k_tile(tile, 0, output, workspace);
     } else {
-        kvarn::store_v_tile(shared, 0, output, workspace);
+        kvarn::store_v_tile(tile, 0, output, workspace);
     }
 }
 
@@ -295,27 +296,27 @@ __global__ void retire_kernel(const std::int32_t* positions, const std::int32_t*
 __global__ void prepare_restore_kernel(std::int32_t* markers, int page, int remainder) {
     if (threadIdx.x != 0 || blockIdx.x != 0) return;
     if (remainder == 0 || page < kKvarnSinkPages) {
-        markers[2] = -1;
-        markers[3] = -1;
+        markers[kKvarnSinkPages]     = -1;
+        markers[kKvarnSinkPages + 1] = -1;
         return;
     }
-    if (markers[2] == page) {
-        markers[3] = -1;
+    if (markers[kKvarnSinkPages] == page) {
+        markers[kKvarnSinkPages + 1] = -1;
         return;
     }
-    if (markers[3] == page) {
-        markers[2] = -1;
+    if (markers[kKvarnSinkPages + 1] == page) {
+        markers[kKvarnSinkPages] = -1;
         return;
     }
-    markers[2] = -(page + 2);
-    markers[3] = -1;
+    markers[kKvarnSinkPages]     = -(page + 2);
+    markers[kKvarnSinkPages + 1] = -1;
 }
 
 __global__ void restore_tail_kernel(const std::uint8_t* records, __nv_bfloat16* tail_k,
                                     __nv_bfloat16* tail_v, const std::int32_t* markers,
                                     const std::int32_t* block_table, int physical_pages, int heads,
                                     int page) {
-    if (markers[2] != -(page + 2)) return;
+    if (markers[kKvarnSinkPages] != -(page + 2)) return;
     const int head     = static_cast<int>(blockIdx.x);
     const int d        = static_cast<int>(threadIdx.x);
     const int physical = block_table[page];
@@ -336,7 +337,8 @@ __global__ void restore_tail_kernel(const std::uint8_t* records, __nv_bfloat16* 
         const int v_code            = (v_packed >> (2 * (d & 3))) & 3;
         const std::int64_t destination =
             static_cast<std::int64_t>(d) +
-            static_cast<std::int64_t>(kvarn::D) * (token + kvarn::Group * (head + heads * 2));
+            static_cast<std::int64_t>(kvarn::D) *
+                (token + kvarn::Group * (head + heads * kKvarnSinkPages));
         const float key =
             fmaf(static_cast<float>(k_code), __half2float(k_scale[d]), __half2float(k_zero[d])) *
             __half2float(k_token_scale[token]);
@@ -349,7 +351,8 @@ __global__ void restore_tail_kernel(const std::uint8_t* records, __nv_bfloat16* 
 }
 
 __global__ void finalize_restore_kernel(std::int32_t* markers, int page) {
-    if (threadIdx.x == 0 && blockIdx.x == 0 && markers[2] == -(page + 2)) markers[2] = page;
+    if (threadIdx.x == 0 && blockIdx.x == 0 && markers[kKvarnSinkPages] == -(page + 2))
+        markers[kKvarnSinkPages] = page;
 }
 
 void rotate_kv(Tensor key, Tensor value, cudaStream_t stream) {
@@ -357,10 +360,9 @@ void rotate_kv(Tensor key, Tensor value, cudaStream_t stream) {
     kvarn_hadamard(value, value, stream);
 }
 
-void stage_and_encode(Tensor key, Tensor value, const Tensor& positions,
-                      const Tensor& valid_columns, const Tensor& table_rows,
-                      KvarnPagedBatchLayerView cache, bool provisional, bool rotate_on_stage,
-                      cudaStream_t stream) {
+void stage_kv(Tensor key, Tensor value, const Tensor& positions, const Tensor& valid_columns,
+              const Tensor& table_rows, KvarnPagedBatchLayerView cache, bool provisional,
+              bool rotate_on_stage, cudaStream_t stream) {
     const int width         = key.ne[2];
     const int batch         = key.ne[3];
     const bool masked       = valid_columns.data != nullptr;
@@ -368,10 +370,6 @@ void stage_and_encode(Tensor key, Tensor value, const Tensor& positions,
     if (provisional && width > 16) {
         throw std::invalid_argument("KVarN provisional append width must be at most 16");
     }
-    static const cudaError_t encode_attribute =
-        cudaFuncSetAttribute(encode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                             static_cast<int>(kStoreSharedBytes));
-    CUDA_CHECK(encode_attribute);
     const auto* key_data      = static_cast<const __nv_bfloat16*>(key.data);
     const auto* value_data    = static_cast<const __nv_bfloat16*>(value.data);
     const auto* position_data = static_cast<const std::int32_t*>(positions.data);
@@ -387,18 +385,30 @@ void stage_and_encode(Tensor key, Tensor value, const Tensor& positions,
             provisional);
     }
     CUDA_CHECK(cudaGetLastError());
+}
+
+void commit_kv(Tensor key, Tensor value, const Tensor& positions, const Tensor& valid_columns,
+               const Tensor& table_rows, KvarnPagedBatchLayerView cache, cudaStream_t stream) {
+    const int width         = positions.ne[0];
+    const int batch         = positions.ne[1];
+    const bool masked       = valid_columns.data != nullptr;
+    const ViewPointers view = pointers(cache);
+    static const cudaError_t encode_attribute =
+        cudaFuncSetAttribute(encode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kStoreSharedBytes));
+    CUDA_CHECK(encode_attribute);
     const int pages = max_touched_pages(width);
     encode_kernel<<<2 * batch * pages * cache.num_kv_heads, kThreads, kStoreSharedBytes, stream>>>(
-        key_data, value_data, position_data, valid_data, row_data, view, width, batch, pages,
-        masked);
+        static_cast<const __nv_bfloat16*>(key.data), static_cast<const __nv_bfloat16*>(value.data),
+        static_cast<const std::int32_t*>(positions.data),
+        masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+        static_cast<const std::int32_t*>(table_rows.data), view, width, batch, pages, masked, -1);
     CUDA_CHECK(cudaGetLastError());
-    if (!provisional) {
-        retire_kernel<<<batch * pages, 1, 0, stream>>>(
-            static_cast<const std::int32_t*>(positions.data),
-            masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
-            static_cast<const std::int32_t*>(table_rows.data), view, width, batch, pages, masked);
-        CUDA_CHECK(cudaGetLastError());
-    }
+    retire_kernel<<<batch * pages, 1, 0, stream>>>(
+        static_cast<const std::int32_t*>(positions.data),
+        masked ? static_cast<const std::int32_t*>(valid_columns.data) : nullptr,
+        static_cast<const std::int32_t*>(table_rows.data), view, width, batch, pages, masked);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 void validate_inputs(const Tensor& query, const Tensor* key, const Tensor* value,
@@ -408,7 +418,8 @@ void validate_inputs(const Tensor& query, const Tensor* key, const Tensor* value
     if (query.dtype != DType::BF16 || query.ne[0] != kvarn::D || query.ne[2] <= 0 ||
         query.ne[3] <= 0 || query.ne[1] % cache.num_kv_heads != 0 || !query.is_contiguous() ||
         output.dtype != DType::BF16 || output.numel() != query.numel() || !output.is_contiguous() ||
-        positions.dtype != DType::I32 || positions.ne[0] != query.ne[2] ||
+        positions.dtype != DType::I32 ||
+        positions.ne[0] != (key == nullptr ? query.ne[2] : key->ne[2]) ||
         positions.ne[1] != query.ne[3] || !positions.is_contiguous() ||
         table_rows.dtype != DType::I32 || table_rows.ne[0] != query.ne[3] ||
         !table_rows.is_contiguous() ||
@@ -419,7 +430,9 @@ void validate_inputs(const Tensor& query, const Tensor* key, const Tensor* value
     }
     if (key != nullptr &&
         (key->dtype != DType::BF16 || value->dtype != DType::BF16 || key->ne[0] != kvarn::D ||
-         key->ne[1] != cache.num_kv_heads || key->ne[2] != query.ne[2] ||
+         key->ne[1] != cache.num_kv_heads || key->ne[2] < query.ne[2] ||
+         (key->ne[2] != query.ne[2] &&
+          (query.ne[2] != 1 || query.ne[3] != 1 || valid_columns.data != nullptr)) ||
          key->ne[3] != query.ne[3] || value->numel() != key->numel() || !key->is_contiguous() ||
          !value->is_contiguous())) {
         throw std::invalid_argument("KVarN attention: invalid K/V tensors");
@@ -451,7 +464,7 @@ std::size_t kvarn_attention_workspace_capacity_bytes(std::int32_t query_heads,
         decode = std::max(
             decode, split_rows * (kvarn::D * sizeof(std::uint16_t) + 2 * sizeof(float)) + 3 * 256);
     }
-    if (batch_size != 1 || max_width < kKvarnGroup) { return decode; }
+    if (batch_size != 1 || max_width < 64) { return decode; }
     const std::size_t slab_tokens =
         std::min<std::size_t>(envelope.max_visible_keys, kvarn::PrefillSlabTokens);
     const std::size_t materialized = 2 * static_cast<std::size_t>(kKvarnHeadDim) * slab_tokens *
@@ -474,10 +487,21 @@ void kvarn_attention(Tensor query, Tensor key, Tensor value, const Tensor& posit
     }
     const bool rotate_on_stage = key.ne[2] <= kFusedStageMaxWidth;
     if (!rotate_on_stage) { rotate_kv(key, value, stream); }
-    stage_and_encode(key, value, positions, valid_columns, kv_table_rows, cache, provisional,
-                     rotate_on_stage, stream);
-    kvarn::decode_attention(query, positions, valid_columns, kv_table_rows, scale, cache, envelope,
-                            workspace, output, stream);
+    stage_kv(key, value, positions, valid_columns, kv_table_rows, cache, provisional,
+             rotate_on_stage, stream);
+    const Tensor query_positions =
+        key.ne[2] == query.ne[2] ? positions : positions.slice(0, key.ne[2] - 1, 1);
+    const kvarn::CurrentKV current =
+        rotate_on_stage
+            ? kvarn::CurrentKV{}
+            : kvarn::CurrentKV{static_cast<const __nv_bfloat16*>(key.data),
+                               static_cast<const __nv_bfloat16*>(value.data),
+                               static_cast<const std::int32_t*>(positions.data), key.ne[2]};
+    kvarn::decode_attention(query, query_positions, valid_columns, kv_table_rows, scale, cache,
+                            envelope, workspace, output, stream, current);
+    if (!provisional) {
+        commit_kv(key, value, positions, valid_columns, kv_table_rows, cache, stream);
+    }
 }
 
 void kvarn_attention_cached(Tensor query, const Tensor& positions, const Tensor& kv_table_rows,
@@ -498,8 +522,11 @@ void kvarn_kv_append(Tensor key, Tensor value, const Tensor& positions, const Te
     require_view(cache);
     const bool rotate_on_stage = key.ne[2] <= kFusedStageMaxWidth;
     if (!rotate_on_stage) { rotate_kv(key, value, stream); }
-    stage_and_encode(key, value, positions, valid_columns, kv_table_rows, cache, provisional,
-                     rotate_on_stage, stream);
+    stage_kv(key, value, positions, valid_columns, kv_table_rows, cache, provisional,
+             rotate_on_stage, stream);
+    if (!provisional) {
+        commit_kv(key, value, positions, valid_columns, kv_table_rows, cache, stream);
+    }
 }
 
 void kvarn_commit_pages(const Tensor& positions, const Tensor& accepted_columns,
@@ -511,15 +538,7 @@ void kvarn_commit_pages(const Tensor& positions, const Tensor& accepted_columns,
         positions.ne[1] != kv_table_rows.ne[0]) {
         throw std::invalid_argument("KVarN commit: invalid metadata");
     }
-    const int width = positions.ne[0];
-    const int batch = positions.ne[1];
-    const int pages = max_touched_pages(width);
-    retire_kernel<<<batch * pages, 1, 0, stream>>>(
-        static_cast<const std::int32_t*>(positions.data),
-        static_cast<const std::int32_t*>(accepted_columns.data),
-        static_cast<const std::int32_t*>(kv_table_rows.data), pointers(cache), width, batch, pages,
-        true);
-    CUDA_CHECK(cudaGetLastError());
+    commit_kv({}, {}, positions, accepted_columns, kv_table_rows, cache, stream);
 }
 
 void kvarn_restore_tail(std::int32_t frontier, KvarnPagedLayerView cache, cudaStream_t stream) {
@@ -539,6 +558,23 @@ void kvarn_restore_tail(std::int32_t frontier, KvarnPagedLayerView cache, cudaSt
     }
     const int page      = frontier / kvarn::Group;
     const int remainder = frontier % kvarn::Group;
+    const ViewPointers view{static_cast<std::uint8_t*>(cache.records.data),
+                            static_cast<__nv_bfloat16*>(cache.tail_k.data),
+                            static_cast<__nv_bfloat16*>(cache.tail_v.data),
+                            static_cast<std::int32_t*>(cache.tail_logical_pages.data),
+                            static_cast<const std::int32_t*>(cache.block_table.data),
+                            cache.records.ne[3],
+                            cache.block_table.ne[0],
+                            1,
+                            cache.num_kv_heads};
+    static const cudaError_t encode_attribute =
+        cudaFuncSetAttribute(encode_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                             static_cast<int>(kStoreSharedBytes));
+    CUDA_CHECK(encode_attribute);
+    constexpr int tails = kKvarnTailSlots - kKvarnSinkPages;
+    encode_kernel<<<2 * tails * cache.num_kv_heads, kThreads, kStoreSharedBytes, stream>>>(
+        nullptr, nullptr, nullptr, nullptr, nullptr, view, 0, 1, tails, false, frontier);
+    CUDA_CHECK(cudaGetLastError());
     prepare_restore_kernel<<<1, 1, 0, stream>>>(
         static_cast<std::int32_t*>(cache.tail_logical_pages.data), page, remainder);
     CUDA_CHECK(cudaGetLastError());

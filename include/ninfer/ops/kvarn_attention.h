@@ -16,10 +16,11 @@ namespace ninfer::ops {
     std::int32_t query_heads, CausalAttentionExecutionEnvelope envelope, std::int32_t batch_size,
     std::int32_t min_width, std::int32_t max_width);
 
-// Appends and attends in the orthonormal KVarN frame. Every newly complete non-sink page is
-// encoded. Provisional calls retain its BF16 tail until commit: queries before the closing position
-// read BF16, queries at/after closure read the record. Rejected suffixes remain overwritable in the
-// tail. Q is transformed in place; K/V are disposable and may also be transformed in place.
+// Appends and attends in the orthonormal KVarN frame. Current-chunk K/V stay unquantized throughout
+// attention. Completed non-sink groups are encoded only after their tokens are committed;
+// provisional groups remain in the tail until acceptance. Rejected suffixes are overwritable.
+// Q/K/V are disposable. For single-row final-query prefill, Q may contain only the last query
+// while K/V and positions contain the entire appended chunk.
 void kvarn_attention(Tensor query, Tensor key, Tensor value, const Tensor& positions,
                      const Tensor& valid_columns, const Tensor& kv_table_rows, float scale,
                      KvarnPagedBatchLayerView cache, bool provisional,
@@ -35,14 +36,15 @@ void kvarn_kv_append(Tensor key, Tensor value, const Tensor& positions, const Te
                      const Tensor& kv_table_rows, KvarnPagedBatchLayerView cache, bool provisional,
                      cudaStream_t stream);
 
-// accepted_columns is an I32 prefix count per batch row. Full non-sink pages in that accepted
-// prefix already have encoded records; only their BF16 markers are retired. Sinks remain lossless.
+// accepted_columns is an I32 prefix count per batch row. Completed non-sink groups in that prefix
+// are encoded from their unquantized tails before their markers are retired. Sinks remain lossless.
 void kvarn_commit_pages(const Tensor& positions, const Tensor& accepted_columns,
                         const Tensor& kv_table_rows, KvarnPagedBatchLayerView cache,
                         cudaStream_t stream);
 
-// Re-establishes the writable represented tail after truncating a retained sequence. A historical
-// partial page is decoded from its record; an already-live partial tail is preserved.
+// Settles completed live groups through the final committed frontier and re-establishes its
+// writable tail. A historical partial group is decoded; an already-live partial tail is preserved.
+// Runtime calls this after output publication has selected the actual prefix, not at licensing.
 void kvarn_restore_tail(std::int32_t frontier, KvarnPagedLayerView cache, cudaStream_t stream);
 
 } // namespace ninfer::ops

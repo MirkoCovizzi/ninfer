@@ -3,6 +3,7 @@
 #include "ninfer/ops/kvarn.h"
 #include "ops/softmax_attention/dense/causal_cache/prompt_common.cuh"
 #include "ops/kvarn/config.cuh"
+#include "ops/kvarn/decode.cuh"
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
@@ -27,7 +28,7 @@ __launch_bounds__(D) __global__
     void materialize_prefill_slab_kernel(PrefillCache cache, Metadata metadata,
                                          const std::int32_t* positions, int width, int slab_begin,
                                          int slab_tokens, __nv_bfloat16* materialized_k,
-                                         __nv_bfloat16* materialized_v) {
+                                         __nv_bfloat16* materialized_v, CurrentKV current) {
     const int logical_page = slab_begin / Group + static_cast<int>(blockIdx.x);
     const int head         = static_cast<int>(blockIdx.y);
     const int d            = static_cast<int>(threadIdx.x);
@@ -57,6 +58,20 @@ __launch_bounds__(D) __global__
                                                 static_cast<std::int64_t>(slab_tokens) * head);
             materialized_k[destination] = cache.tail_k[source];
             materialized_v[destination] = cache.tail_v[source];
+        }
+        return;
+    }
+
+    if (current.key != nullptr && page_begin >= current.positions[0]) {
+        const int begin = current.positions[0];
+        for (int token = 0; token < Group && page_begin + token < visible; ++token) {
+            const std::int64_t source = d + static_cast<std::int64_t>(D) *
+                                                (head + cache.heads * (page_begin + token - begin));
+            const std::int64_t destination =
+                d + static_cast<std::int64_t>(D) * (page_begin + token - slab_begin +
+                                                    static_cast<std::int64_t>(slab_tokens) * head);
+            materialized_k[destination] = current.key[source];
+            materialized_v[destination] = current.value[source];
         }
         return;
     }
@@ -107,7 +122,7 @@ struct MaterializedPrefillInput {
 
     template <bool Key>
     __device__ __forceinline__ void stage(__nv_bfloat16* destination, int kv_head, int k0,
-                                          int max_query_abs, int, int tid) const {
+                                          int max_query_abs, int tid) const {
         constexpr int Bc        = kCausalPromptBc;
         constexpr int Threads   = kCausalPromptThreads;
         constexpr int VecPerRow = D / 8;

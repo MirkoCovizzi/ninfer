@@ -17,7 +17,7 @@ namespace {
 
 constexpr int kThreads = 256;
 constexpr std::size_t kStoreSharedBytes =
-    ((kvarn::D + 1) * kvarn::Group + 8 * kvarn::D + 16) * sizeof(float);
+    (kvarn::D + 1) * kvarn::Group * sizeof(__nv_bfloat16) + (8 * kvarn::D + 16) * sizeof(float);
 
 void require_tensor(const Tensor& tensor, DType dtype, std::int32_t n0, std::int32_t n1,
                     std::int32_t n2, const char* name) {
@@ -44,17 +44,16 @@ std::int32_t validate_storage(const KvarnTileStorage& storage) {
 __global__ void store_kernel(const __nv_bfloat16* k, const __nv_bfloat16* v,
                              kvarn::StorePointers output, int tiles) {
     extern __shared__ float shared[];
-    float* tile             = shared;
+    auto* tile              = reinterpret_cast<__nv_bfloat16*>(shared);
     const int encoded       = static_cast<int>(blockIdx.x);
     const bool key          = encoded < tiles;
     const int record        = key ? encoded : encoded - tiles;
     const std::int64_t base = static_cast<std::int64_t>(record) * kvarn::D * kvarn::Group;
     for (int index = static_cast<int>(threadIdx.x); index < kvarn::D * kvarn::Group;
          index += static_cast<int>(blockDim.x)) {
-        const int token = index / kvarn::D;
-        const int d     = index - token * kvarn::D;
-        tile[d + (kvarn::D + 1) * token] =
-            __bfloat162float(key ? k[base + index] : v[base + index]);
+        const int token                  = index / kvarn::D;
+        const int d                      = index - token * kvarn::D;
+        tile[d + (kvarn::D + 1) * token] = key ? k[base + index] : v[base + index];
     }
     __syncthreads();
     const kvarn::SinkhornWorkspace workspace = kvarn::workspace_after(tile);
